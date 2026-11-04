@@ -355,6 +355,95 @@ class Service(unittest.TestCase):
 		self.assertIn("Couldn't find a shot", data["error"])
 		self.assertEqual(self.call_count(), 0)
 
+	# --- Drafts: jobs that outlive the connection ---------------------------------------
+
+	def request(self, method, path, body=None):
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+		connection.request(method, path, json.dumps(body) if body is not None else None)
+		response = connection.getresponse()
+		data = json.loads(response.read())
+		connection.close()
+		return response.status, data
+
+	def submit_job(self, prompt="A photo.", **extra):
+		body = {"prompt": prompt, "init_images": [garment_photo()], "width": 768, "height": 1024, "batch_size": 1}
+		body.update(extra)
+		return self.request("POST", "/jobs", body)
+
+	def wait_for_status(self, job_id, status, seconds=10):
+		return self.wait_until(lambda: self.request("GET", f"/jobs/{job_id}")[1]["status"] == status, seconds)
+
+	def test_job_is_accepted_at_once_and_collected_later(self):
+		os.environ["FAKE_SLEEP"] = "0.3"
+		status, data = self.submit_job()
+		self.assertEqual(status, 202)
+		self.assertIn(data["status"], ("queued", "running"))
+		self.assertEqual(self.request("GET", f"/jobs/{data['job_id']}/result")[0], 409)
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+		status, result = self.request("GET", f"/jobs/{data['job_id']}/result")
+		self.assertEqual(status, 200)
+		self.assertEqual(Image.open(io.BytesIO(base64.b64decode(result["images"][0]))).size, (768, 1024))
+		self.assertEqual(self.health()["drafts_waiting"], 1)
+
+	def test_the_draft_stays_until_collected_then_goes(self):
+		_, data = self.submit_job()
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+		folder = os.path.join(self.service.jobs_root, data["job_id"])
+		self.assertEqual(sorted(os.listdir(folder)), ["meta.json", "result.png"])  # photo dropped once drawn
+		self.assertEqual(self.request("GET", f"/jobs/{data['job_id']}/result")[0], 200)
+		self.assertEqual(self.request("GET", f"/jobs/{data['job_id']}/result")[0], 200)
+		self.assertEqual(self.request("DELETE", f"/jobs/{data['job_id']}")[0], 200)
+		self.assertFalse(os.path.exists(folder))
+		self.assertEqual(self.request("GET", f"/jobs/{data['job_id']}")[0], 404)
+
+	def test_same_job_again_is_not_drawn_twice(self):
+		_, first = self.submit_job()
+		_, second = self.submit_job()
+		self.assertEqual(first["job_id"], second["job_id"])
+		self.assertTrue(self.wait_for_status(first["job_id"], "done"))
+		self.assertEqual(self.call_count(), 1)
+
+	def test_a_new_seed_is_a_new_job(self):
+		_, first = self.submit_job(seed=1)
+		_, second = self.submit_job(seed=2)
+		self.assertNotEqual(first["job_id"], second["job_id"])
+		self.assertTrue(self.wait_for_status(second["job_id"], "done"))
+		self.assertEqual(self.call_count(), 2)
+		self.assertEqual(self.submit_job(seed=-1)[0], 400)
+
+	def test_a_failed_job_is_kept_and_a_retry_carries_on(self):
+		open(self.fail_flag, "w").close()
+		_, data = self.submit_job()
+		self.assertTrue(self.wait_for_status(data["job_id"], "failed"))
+		self.assertTrue(self.request("GET", f"/jobs/{data['job_id']}")[1]["error"])
+		os.remove(self.fail_flag)
+		status, again = self.submit_job()
+		self.assertEqual(again["job_id"], data["job_id"])
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+
+	def test_drafts_survive_a_restart_and_unfinished_jobs_resume(self):
+		config = dict(self.config, temp_dir=os.path.join(self.folder.name, "tmp2"), jobs_dir=os.path.join(self.folder.name, "jobs2"))
+
+		def draft(prompt):
+			return server.parse_request(json.dumps({
+				"prompt": prompt, "init_images": [garment_photo()], "width": 768, "height": 1024, "batch_size": 1,
+			}))
+
+		before = server.Service(config)
+		before.start()
+		done = before.submit_durable(draft("Finished photo."))
+		self.assertTrue(self.wait_until(lambda: before.durable_state(done.key)["status"] == "done"))
+		before.queue = __import__("queue").Queue()  # nobody reads this one: the power went out
+		pending = [before.submit_durable(draft(f"Pending photo {n}.")) for n in range(2)]
+
+		after = server.Service(config)
+		after.start()
+		self.assertEqual(after.durable_state(done.key)["status"], "done")
+		self.assertTrue(after.durable_result(done.key))
+		for job in pending:
+			self.assertTrue(self.wait_until(lambda: after.durable_state(job.key)["status"] == "done"))
+		self.assertEqual(self.call_count(), 3)
+
 	def test_health_names_missing_files(self):
 		self.config["weights"]["--vae"] = "/nonexistent/vae.safetensors"
 		state = self.health()

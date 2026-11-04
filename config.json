@@ -20,5 +20,7 @@
 	"memory_settle_seconds": 120,
 	"memory_settle_free_percent": 40,
 	"generation_timeout_seconds": 3600,
-	"result_ttl_seconds": 1800
+	"result_ttl_seconds": 1800,
+	"jobs_dir": "runtime/jobs",
+	"draft_retention_days": 30
 }

@@ -16,13 +16,28 @@ A successful call returns 200 with `{"images": ["<base64 PNG>"]}`. Bad requests 
 
 `GET /health` returns `model`, `ready`, `missing_files`, `loaded`, `busy`, `queue_length`, `progress` and `results_kept`. `loaded` and `busy` always match, because the model is only in memory during a run.
 
+### Drafts: jobs that outlive the connection
+
+The laptop doesn't have to stay connected while a drawing runs.
+
+| Call | Does |
+|---|---|
+| `POST /jobs` | Same body as img2img, plus an optional `seed`. Saves the job to disk and answers `202` at once with `{"job_id", "status"}`. The same request again returns the same job; a failed one is queued again and carries on from its finished photos. |
+| `GET /jobs/{id}` | `status` is `queued`, `running`, `done` or `failed`, with `progress` and `error`. |
+| `GET /jobs/{id}/result` | `{"images": ["<base64 PNG>"]}` once done, `409` before that. Can be fetched again. |
+| `DELETE /jobs/{id}` | The laptop has the draft safely: deletes the job's folder. |
+| `GET /jobs` | Every job on disk. |
+
+Jobs live in `runtime/jobs/<id>/` (`jobs_dir` in `config.json`). After a crash, restart or reboot the service picks up where it left off: finished drafts wait to be collected, queued and half-drawn jobs run again, keeping the photos already drawn. A draft nobody collects is deleted after `draft_retention_days` (30).
+
 ## How it behaves
 
 - It runs one request at a time and queues the rest.
 - A grid prompt is split, and each panel is drawn on its own, then placed edge to edge. A 16 GB Mac can't draw the whole grid at once. See `panels.py`.
 - If the connection drops, the run still finishes. The result stays in memory for 30 minutes, and sending the same request again returns it.
 - If a request fails part way, finished panels stay in memory for 30 minutes, so a retry only draws the rest.
-- Photos reach disk only in `runtime/tmp` during a run, and that folder is cleared after each run and at startup. Logs hold job ids, sizes and timings, never photos or prompts.
+- Plain `/sdapi/v1/img2img` calls only put photos on disk in `runtime/tmp` during a run; that folder is cleared after each run and at startup.
+- Jobs sent to `/jobs` are the exception: the garment photo stays in `runtime/jobs/<id>/` until the drawing finishes, and the result until the laptop collects it. Keep that folder private. Logs hold job ids, sizes and timings, never photos or prompts.
 
 ## Model
 
