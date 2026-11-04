@@ -1,0 +1,366 @@
+"""Run with: .venv/bin/python -m unittest discover tests"""
+
+import base64
+import http.client
+import io
+import json
+import os
+import stat
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+from PIL import Image
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+import panels  # noqa: E402
+import server  # noqa: E402
+
+LAYOUT_2X2 = (
+	"Layout: a single image made of exactly 2 rows × 2 columns = 4 equal panels, edge to edge, "
+	"with no gaps, borders, frames, captions or dividing lines between them. "
+	"Keep each panel's subject fully inside its own panel."
+)
+LAYOUT_1X2 = LAYOUT_2X2.replace("2 rows × 2 columns = 4", "1 row × 2 columns = 2")
+HOUSE = "Photorealistic high-end editorial fashion photography.\nNo text, logos or borders."
+
+STORY = "\n\n".join((
+	"A 2x2 grid composite fashion photoshoot featuring 4 distinct sequential shots of the same model in a professional studio setting.",
+	"[MODEL]\nDeep ebony skin, short natural afro.",
+	"[WARDROBE]\nShe is wearing the garment in the attached photo.",
+	"[DIRECTORIAL NARRATIVE ARC: Hesitation to Authority]\n"
+	"- Top-left frame (Shot 1): Seated, hands clasped.\n"
+	"- Top-right frame (Shot 2): One hand on hip.\n"
+	"- Bottom-left frame (Shot 3): Feet apart, neutral gaze.\n"
+	"- Bottom-right frame (Shot 4): Hands on hips, commanding smile.",
+	"[STYLE & RENDERING]\nConsistent lighting.",
+	LAYOUT_2X2,
+	HOUSE,
+))
+LOOKBOOK = "\n\n".join((
+	"Show one Ghanaian woman model wearing the garment, as four photos: "
+	"top-left, full-body front view standing tall; top-right, full-body three-quarter view mid-stride; "
+	"bottom-left, full-body back view; bottom-right, waist-up shot with one hand at the waist showing the fabric. "
+	"Same model, hair, makeup, simple gold jewellery and backdrop in all four. "
+	"In the full-body shots keep the whole figure in frame, head to shoes.",
+	LAYOUT_2X2,
+	HOUSE,
+))
+FRONT_BACK = "\n\n".join((
+	"Show one Ghanaian woman model wearing the garment, as two photos side by side: "
+	"left, full-body front view; right, full-body back view in the same pose. "
+	"Same model and backdrop in both, whole figure in frame, head to shoes.",
+	LAYOUT_1X2,
+	HOUSE,
+))
+FABRIC = "\n\n".join((
+	"Four macro close-up photos of the garment itself: top-left, the fabric print and texture filling the frame; "
+	"top-right, the waistband or neckline; bottom-left, the hem; bottom-right, a seam, trim or finishing detail. "
+	"Shallow depth of field, crisp focus on the fabric.",
+	LAYOUT_2X2,
+	HOUSE,
+))
+
+
+def garment_photo():
+	buffer = io.BytesIO()
+	Image.new("RGB", (1536, 2048), (10, 120, 60)).save(buffer, "JPEG")
+	return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+class SplitPrompts(unittest.TestCase):
+	def test_single_photo_is_left_alone(self):
+		self.assertEqual(panels.split_prompt("One editorial photo."), (1, 1, ["One editorial photo."]))
+
+	def test_story_keeps_the_woman_and_one_shot_each(self):
+		rows, cols, texts = panels.split_prompt(STORY)
+		self.assertEqual((rows, cols, len(texts)), (2, 2, 4))
+		self.assertIn("Seated, hands clasped.", texts[0])
+		self.assertNotIn("One hand on hip", texts[0])
+		self.assertIn("Hands on hips", texts[3])
+		for text in texts:
+			self.assertIn("Deep ebony skin", text)
+			self.assertIn("She is wearing the garment", text)
+			self.assertIn("Photorealistic high-end", text)
+			self.assertNotIn("grid composite", text)
+			self.assertNotIn("Layout:", text)
+			self.assertNotIn(" frame (Shot", text)
+
+	def test_lookbook(self):
+		rows, cols, texts = panels.split_prompt(LOOKBOOK)
+		self.assertEqual((rows, cols, len(texts)), (2, 2, 4))
+		self.assertTrue(texts[2].startswith(
+			"Show one Ghanaian woman model wearing the garment, as one photo: full-body back view."
+		))
+		self.assertIn("backdrop. In the full-body", texts[2])
+		self.assertNotIn("top-right", texts[2])
+		self.assertNotIn("in all four", texts[2])
+
+	def test_front_and_back(self):
+		rows, cols, texts = panels.split_prompt(FRONT_BACK)
+		self.assertEqual((rows, cols, len(texts)), (1, 2, 2))
+		self.assertIn("as one photo: full-body back view in the same pose.", texts[1])
+		self.assertNotIn("side by side", texts[1])
+		self.assertNotIn("in both", texts[1])
+
+	def test_fabric(self):
+		_, _, texts = panels.split_prompt(FABRIC)
+		self.assertTrue(texts[2].startswith("one macro close-up photo of the garment itself: the hem."))
+		self.assertIn("a seam, trim or finishing detail.", texts[3])
+
+	def test_grid_it_cannot_read_is_refused(self):
+		with self.assertRaises(panels.PromptError):
+			panels.split_prompt("Four photos of a dress in various poses.\n\n" + LAYOUT_2X2)
+
+	def test_panels_cover_the_image_exactly(self):
+		plan = panels.plan(FRONT_BACK, 2048, 1344, 1024)
+		self.assertEqual([p.box for p in plan], [(0, 0, 1024, 1344), (1024, 0, 2048, 1344)])
+		for panel in plan:
+			self.assertLessEqual(max(panel.draw_size), 1024)
+			self.assertEqual([side % 32 for side in panel.draw_size], [0, 0])
+		self.assertEqual(panels.plan(STORY, 1536, 2048, 1024)[3].box, (768, 1024, 1536, 2048))
+		self.assertEqual(panels.plan(STORY, 1536, 2048, 1024)[0].draw_size, (768, 1024))
+
+
+class Service(unittest.TestCase):
+	def setUp(self):
+		self.folder = tempfile.TemporaryDirectory()
+		self.addCleanup(self.folder.cleanup)
+		self.calls = os.path.join(self.folder.name, "calls")
+		self.fail_flag = os.path.join(self.folder.name, "fail")
+		open(self.calls, "w").close()
+
+		cli = os.path.join(self.folder.name, "sd-cli")
+		with open(cli, "w") as f:
+			f.write(f"#!/bin/sh\nexec '{sys.executable}' '{os.path.join(HERE, 'fake_sd_cli.py')}' \"$@\"\n")
+		os.chmod(cli, os.stat(cli).st_mode | stat.S_IEXEC)
+
+		os.environ["FAKE_CALLS"] = self.calls
+		os.environ["FAKE_FAIL"] = self.fail_flag
+		os.environ["FAKE_FAIL_ONCE"] = self.fail_flag + "-once"
+		os.environ["FAKE_SLEEP"] = "0"
+
+		self.config = {
+			"model_name": "test",
+			"port": 0,
+			"sd_cli": cli,
+			"temp_dir": os.path.join(self.folder.name, "tmp"),
+			"weights": {flag: cli for flag in ("--diffusion-model", "--vae", "--llm", "--llm_vision")},
+			"memory_settle_seconds": 0,
+			"memory_settle_free_percent": 40,
+			"seed": 42,
+			"steps": 2,
+			"cfg_scale": 1.0,
+			"sampling_method": "euler",
+			"max_long_side": 1024,
+			"reference_long_side": 1024,
+			"garment_instruction": "",
+			"extra_args": [],
+			"memory_retries": 0,
+			"generation_timeout_seconds": 30,
+			"result_ttl_seconds": 1800,
+		}
+		self.server, self.service = server.make_server(self.config)
+		self.service.start()
+		threading.Thread(target=self.server.serve_forever, daemon=True).start()
+		self.addCleanup(self.server.server_close)
+		self.addCleanup(self.server.shutdown)
+		self.port = self.server.server_address[1]
+
+	def post(self, prompt="A photo.", width=768, height=1024, **extra):
+		body = {"prompt": prompt, "init_images": [garment_photo()], "width": width, "height": height, "batch_size": 1}
+		body.update(extra)
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+		connection.request("POST", "/sdapi/v1/img2img", json.dumps(body), {"Content-Type": "application/json"})
+		response = connection.getresponse()
+		data = json.loads(response.read())
+		connection.close()
+		return response.status, data
+
+	def health(self):
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+		connection.request("GET", "/health")
+		data = json.loads(connection.getresponse().read())
+		connection.close()
+		return data
+
+	def call_count(self):
+		with open(self.calls) as f:
+			return len(f.readlines())
+
+	def wait_until(self, check, seconds=10):
+		end = time.monotonic() + seconds
+		while time.monotonic() < end:
+			if check():
+				return True
+			time.sleep(0.02)
+		return False
+
+	def test_listens_on_loopback_only(self):
+		self.assertEqual(self.server.server_address[0], "127.0.0.1")
+
+	def test_answer_is_the_shape_the_laptop_reads(self):
+		status, data = self.post(width=768, height=1024)
+		self.assertEqual(status, 200)
+		image = Image.open(io.BytesIO(base64.b64decode(data["images"][0])))
+		self.assertEqual(image.size, (768, 1024))
+
+	def test_size_is_exact_even_when_the_model_draws_smaller(self):
+		status, data = self.post(width=1536, height=2048)
+		self.assertEqual(status, 200)
+		self.assertEqual(Image.open(io.BytesIO(base64.b64decode(data["images"][0]))).size, (1536, 2048))
+		self.assertEqual(self.call_count(), 1)
+
+	def test_grid_draws_each_panel_and_fills_the_canvas(self):
+		status, data = self.post(STORY, width=1536, height=2048)
+		self.assertEqual(status, 200)
+		self.assertEqual(self.call_count(), 4)
+		image = Image.open(io.BytesIO(base64.b64decode(data["images"][0]))).convert("RGB")
+		self.assertEqual(image.size, (1536, 2048))
+		for point in ((0, 0), (767, 1023), (768, 1024), (1535, 2047)):
+			self.assertEqual(image.getpixel(point), (200, 40, 40))
+
+	def test_same_request_returns_the_kept_result(self):
+		first = self.post()
+		second = self.post()
+		self.assertEqual(first, second)
+		self.assertEqual(self.call_count(), 1)
+
+	def test_a_different_prompt_runs_again(self):
+		self.post("A photo.")
+		self.post("Another photo.")
+		self.assertEqual(self.call_count(), 2)
+
+	def test_result_expires(self):
+		self.config["result_ttl_seconds"] = 0
+		self.post()
+		time.sleep(0.01)
+		self.post()
+		self.assertEqual(self.call_count(), 2)
+
+	def test_failure_is_clear_and_the_service_survives(self):
+		open(self.fail_flag, "w").close()
+		status, data = self.post()
+		self.assertEqual(status, 500)
+		self.assertIn("ran out of memory", data["error"])
+		self.assertLess(len(json.dumps(data)), 200)
+
+		os.remove(self.fail_flag)
+		status, _ = self.post()
+		self.assertEqual(status, 200)
+		self.assertEqual(self.call_count(), 2)
+
+	def test_memory_failure_is_tried_again(self):
+		self.config["memory_retries"] = 1
+		open(self.fail_flag + "-once", "w").close()
+		status, _ = self.post()
+		self.assertEqual(status, 200)
+		self.assertEqual(self.call_count(), 2)
+
+	def test_retry_after_a_failure_keeps_finished_photos(self):
+		os.environ["FAKE_FAIL_ON"] = "One hand on hip"
+		self.addCleanup(os.environ.pop, "FAKE_FAIL_ON", None)
+		open(self.fail_flag + "-on", "w").close()
+		status, _ = self.post(STORY, width=1536, height=2048)
+		self.assertEqual(status, 500)
+		self.assertEqual(self.call_count(), 2)
+
+		os.remove(self.fail_flag + "-on")
+		status, data = self.post(STORY, width=1536, height=2048)
+		self.assertEqual(status, 200)
+		self.assertEqual(self.call_count(), 5)
+		image = Image.open(io.BytesIO(base64.b64decode(data["images"][0]))).convert("RGB")
+		self.assertEqual(image.getpixel((10, 10)), (200, 40, 40))
+		self.assertEqual(self.service.unfinished, {})
+
+	def test_gives_up_when_retries_run_out(self):
+		open(self.fail_flag + "-once", "w").close()
+		status, data = self.post()
+		self.assertEqual(status, 500)
+		self.assertIn("ran out of memory", data["error"])
+		self.assertEqual(self.call_count(), 1)
+
+	def test_garment_instruction_reaches_every_photo(self):
+		self.config["garment_instruction"] = "Keep the fabric unbroken."
+		self.post(STORY, width=1536, height=2048)
+		with open(self.calls) as f:
+			lines = f.readlines()
+		self.assertEqual(len(lines), 4)
+		for line in lines:
+			self.assertIn("Keep the fabric unbroken.", line)
+
+	def test_runs_one_at_a_time_and_reports_the_queue(self):
+		os.environ["FAKE_SLEEP"] = "0.4"
+		results = []
+		threads = [
+			threading.Thread(target=lambda n=n: results.append(self.post(f"Photo {n}.")))
+			for n in range(3)
+		]
+		for thread in threads:
+			thread.start()
+		self.assertTrue(self.wait_until(
+			lambda: self.health()["queue_length"] == 2 and self.health()["progress"] == "photo 1 of 1"
+		))
+		self.assertTrue(self.health()["busy"])
+		self.assertLessEqual(self.call_count(), 1)
+		for thread in threads:
+			thread.join()
+		self.assertEqual([status for status, _ in results], [200, 200, 200])
+		self.assertFalse(self.health()["busy"])
+
+	def test_run_finishes_after_the_connection_drops(self):
+		os.environ["FAKE_SLEEP"] = "0.3"
+		body = json.dumps({
+			"prompt": "A photo.", "init_images": [garment_photo()], "width": 768, "height": 1024, "batch_size": 1,
+		})
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+		connection.request("POST", "/sdapi/v1/img2img", body)
+		self.assertTrue(self.wait_until(lambda: self.health()["busy"]))
+		connection.close()
+
+		self.assertTrue(self.wait_until(lambda: self.health()["results_kept"] == 1))
+		status, _ = self.post()
+		self.assertEqual(status, 200)
+		self.assertEqual(self.call_count(), 1)
+
+	def test_keeps_no_photos_on_disk(self):
+		self.post(STORY, width=1536, height=2048)
+		leftovers = []
+		for _, _, files in os.walk(self.config["temp_dir"]):
+			leftovers += files
+		self.assertEqual(leftovers, [])
+
+	def test_bad_requests_get_a_clear_answer(self):
+		cases = [
+			({"prompt": ""}, "no prompt"),
+			({"init_images": []}, "exactly one garment photo"),
+			({"init_images": ["not base64!"]}, "valid base64"),
+			({"init_images": [base64.b64encode(b"not an image").decode()]}, "opened as an image"),
+			({"width": "768"}, "Width and height"),
+			({"batch_size": 2}, "batch_size"),
+		]
+		for extra, expected in cases:
+			status, data = self.post(**extra)
+			self.assertEqual(status, 400, extra)
+			self.assertIn(expected, data["error"])
+		self.assertEqual(self.call_count(), 0)
+
+	def test_grid_it_cannot_read_gets_a_clear_answer(self):
+		status, data = self.post("Four poses.\n\n" + LAYOUT_2X2, width=1536, height=2048)
+		self.assertEqual(status, 400)
+		self.assertIn("Couldn't find a shot", data["error"])
+		self.assertEqual(self.call_count(), 0)
+
+	def test_health_names_missing_files(self):
+		self.config["weights"]["--vae"] = "/nonexistent/vae.safetensors"
+		state = self.health()
+		self.assertFalse(state["ready"])
+		self.assertEqual(state["missing_files"], ["vae.safetensors"])
+
+
+if __name__ == "__main__":
+	unittest.main()
