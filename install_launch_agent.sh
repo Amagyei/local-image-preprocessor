@@ -34,5 +34,10 @@ cat > "$PLIST" <<EOF
 EOF
 
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# Removing the old copy finishes in the background, so the first tries can fail.
+for attempt in 1 2 3 4 5 6; do
+	launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && break
+	[ "$attempt" = 6 ] && { echo "Couldn't start $LABEL" >&2; exit 1; }
+	sleep 5
+done
 echo "Installed $PLIST"
