@@ -43,6 +43,7 @@ class Job:
 		self.key = key
 		self.seed = seed  # asked for by the caller, e.g. to redo a draw differently
 		self.durable = False  # kept on disk until the caller collects it
+		self.cancelled = False  # the caller doesn't want it any more
 		self.folder = None
 		self.created = time.time()
 		self.finished_wall = None
@@ -189,15 +190,21 @@ class Service:
 			return None
 		return self.image_of(job)
 
-	def durable_ack(self, key):
-		"""The laptop has the draft safely: forget it, photo and all."""
+	def durable_forget(self, key):
+		"""The laptop is done with this job, drawn or not: forget it, photo and all."""
 		with self.lock:
 			job = self.jobs.get(key)
-			if not job or not job.durable or not job.done.is_set():
+			if not job or not job.durable:
 				return False
 			del self.jobs[key]
-		shutil.rmtree(job.folder, ignore_errors=True)
-		log.info("job=%s collected and removed", key[:12])
+			job.cancelled = True
+			running = job is self.current
+		if running:
+			self.engine.cancel()  # the worker removes its folder when it lets go
+		else:
+			self.unfinished.pop(key, None)
+			shutil.rmtree(job.folder, ignore_errors=True)
+		log.info("job=%s removed", key[:12])
 		return True
 
 	def image_of(self, job):
@@ -291,7 +298,10 @@ class Service:
 	def _work(self):
 		while True:
 			job = self.queue.get()
-			self.current = job
+			with self.lock:
+				if job.cancelled:
+					continue
+				self.current = job
 			try:
 				image = self._run(job)
 				job.finished_wall = time.time()
@@ -315,7 +325,12 @@ class Service:
 				if not job.durable:
 					job.photo = None
 				job.finished_at = time.monotonic()
-				self.current = None
+				with self.lock:
+					self.current = None
+					forgotten = job.cancelled and job.key not in self.jobs
+				if forgotten:
+					self.unfinished.pop(job.key, None)
+					shutil.rmtree(job.folder, ignore_errors=True)
 				job.done.set()
 
 	def _fail(self, job, status, message):
@@ -324,7 +339,10 @@ class Service:
 		if job.durable:
 			# Kept, with its finished photos, so the laptop sees the failure and a retry carries on.
 			job.finished_wall = time.time()
-			self._write_meta(job, "failed")
+			try:
+				self._write_meta(job, "failed")
+			except Exception:  # noqa: BLE001 — a full disk, say: the queue must carry on regardless
+				log.exception("job=%s couldn't record its failure", job.key[:12])
 			return
 		# Failures aren't kept: the next try should really try again.
 		with self.lock:
@@ -353,6 +371,8 @@ class Service:
 
 			canvas = Image.new("RGB", (job.width, job.height))
 			for panel in plan:
+				if job.cancelled:
+					raise GenerationError("Cancelled.")
 				job.progress = f"photo {panel.number} of {len(plan)}"
 				left, top, right, bottom = panel.box
 				if panel.number in kept["panels"]:
@@ -368,6 +388,7 @@ class Service:
 						height=panel.draw_size[1],
 						seed=seed,
 						output=output,
+						is_cancelled=lambda: job.cancelled,
 					)
 				except GenerationError as e:
 					raise GenerationError(f"Photo {panel.number} of {len(plan)}: {e}")
@@ -475,10 +496,10 @@ def make_handler(service):
 		def do_DELETE(self):
 			parts = self.path.strip("/").split("/")
 			if len(parts) == 2 and parts[0] == "jobs":
-				if service.durable_ack(parts[1]):
+				if service.durable_forget(parts[1]):
 					self._send(200, {"removed": True})
 				else:
-					self._send(404, {"error": "No finished job with that id."})
+					self._send(404, {"error": "No job with that id."})
 			else:
 				self._send(404, {"error": "Not found."})
 

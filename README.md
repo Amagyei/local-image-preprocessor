@@ -25,7 +25,7 @@ The laptop doesn't have to stay connected while a drawing runs.
 | `POST /jobs` | Same body as img2img, plus an optional `seed`. Saves the job to disk and answers `202` at once with `{"job_id", "status"}`. The same request again returns the same job; a failed one is queued again and carries on from its finished photos. |
 | `GET /jobs/{id}` | `status` is `queued`, `running`, `done` or `failed`, with `progress` and `error`. |
 | `GET /jobs/{id}/result` | `{"images": ["<base64 PNG>"]}` once done, `409` before that. Can be fetched again. |
-| `DELETE /jobs/{id}` | The laptop has the draft safely: deletes the job's folder. |
+| `DELETE /jobs/{id}` | The laptop is done with this job: deletes its folder. A queued job won't be drawn, and a running one stops at once. |
 | `GET /jobs` | Every job on disk. |
 
 Jobs live in `runtime/jobs/<id>/` (`jobs_dir` in `config.json`). After a crash, restart or reboot the service picks up where it left off: finished drafts wait to be collected, queued and half-drawn jobs run again, keeping the photos already drawn. A draft nobody collects is deleted after `draft_retention_days` (30).
@@ -81,4 +81,4 @@ Tests use a stand-in for sd-cli, so they need no weights:
 
 ## Prompts
 
-`garment_instruction` in `config.json` adds the same line to every prompt, so it stays empty: not every garment is full length. Klein tends to shorten long garments, so the laptop's prompt should state each garment's length.
+`garment_instruction` in `config.json` adds the same line to every prompt, so it stays empty: not every garment is full length. Klein tends to shorten long garments, so Studio's form has a Garment length field that adds it to the prompt.

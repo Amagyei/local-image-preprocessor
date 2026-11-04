@@ -112,6 +112,13 @@ class SplitPrompts(unittest.TestCase):
 		self.assertTrue(texts[2].startswith("one macro close-up photo of the garment itself: the hem."))
 		self.assertIn("a seam, trim or finishing detail.", texts[3])
 
+	def test_a_paragraph_the_laptop_adds_reaches_every_photo(self):
+		line = "Garment length: floor-length maxi. Wherever the whole garment is in frame, its hem falls at exactly this length."
+		for prompt in (STORY, LOOKBOOK, FRONT_BACK, FABRIC):
+			_rows, _cols, texts = panels.split_prompt(f"{prompt}\n\n{line}")
+			for text in texts:
+				self.assertIn(line, text)
+
 	def test_grid_it_cannot_read_is_refused(self):
 		with self.assertRaises(panels.PromptError):
 			panels.split_prompt("Four photos of a dress in various poses.\n\n" + LAYOUT_2X2)
@@ -420,6 +427,47 @@ class Service(unittest.TestCase):
 		status, again = self.submit_job()
 		self.assertEqual(again["job_id"], data["job_id"])
 		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+
+	def test_a_queued_job_can_be_cancelled(self):
+		os.environ["FAKE_SLEEP"] = "0.5"
+		_, first = self.submit_job("First photo.")
+		_, second = self.submit_job("Second photo.")
+		self.assertEqual(self.request("DELETE", f"/jobs/{second['job_id']}")[0], 200)
+		self.assertEqual(self.request("GET", f"/jobs/{second['job_id']}")[0], 404)
+		self.assertFalse(os.path.exists(os.path.join(self.service.jobs_root, second["job_id"])))
+		self.assertTrue(self.wait_for_status(first["job_id"], "done"))
+		self.assertEqual(self.call_count(), 1)
+
+	def test_a_running_job_can_be_cancelled_and_the_queue_moves_on(self):
+		self.config["memory_retries"] = 2  # a cancelled photo mustn't be mistaken for running out of memory
+		os.environ["FAKE_SLEEP"] = "60"
+		_, first = self.submit_job("First photo.")
+		self.assertTrue(self.wait_until(lambda: self.call_count() == 1))
+		time.sleep(0.2)
+		os.environ["FAKE_SLEEP"] = "0"
+		_, second = self.submit_job("Second photo.")
+		self.assertEqual(self.request("DELETE", f"/jobs/{first['job_id']}")[0], 200)
+		self.assertTrue(self.wait_for_status(second["job_id"], "done"))
+		self.assertEqual(self.call_count(), 2)
+		self.assertFalse(os.path.exists(os.path.join(self.service.jobs_root, first["job_id"])))
+
+	def test_cancelling_an_unknown_job_says_so(self):
+		self.assertEqual(self.request("DELETE", "/jobs/nothing")[0], 404)
+
+	def test_a_failure_recording_a_failure_does_not_stop_the_queue(self):
+		real = self.service._write_meta
+
+		def full_disk(job, state, seed=None):
+			if state in ("running", "failed"):
+				raise OSError(28, "No space left on device")
+			return real(job, state, seed)
+
+		self.service._write_meta = full_disk
+		_, first = self.submit_job("First photo.")
+		self.assertTrue(self.wait_for_status(first["job_id"], "failed"))
+		self.service._write_meta = real
+		_, second = self.submit_job("Second photo.")
+		self.assertTrue(self.wait_for_status(second["job_id"], "done"))
 
 	def test_drafts_survive_a_restart_and_unfinished_jobs_resume(self):
 		config = dict(self.config, temp_dir=os.path.join(self.folder.name, "tmp2"), jobs_dir=os.path.join(self.folder.name, "jobs2"))

@@ -35,13 +35,14 @@ class SdCli:
 		self.config = config
 		self._process = None
 		self._stopping = False
+		self._cancelled = False
 		self._lock = threading.Lock()
 
 	def missing_files(self):
 		paths = [self.config["sd_cli"], *self.config["weights"].values()]
 		return [path for path in paths if not os.path.exists(path)]
 
-	def generate(self, *, prompt, reference, width, height, seed, output):
+	def generate(self, *, prompt, reference, width, height, seed, output, is_cancelled=lambda: False):
 		"""Write a PNG to `output` and return the seconds it took. Raises GenerationError."""
 		c = self.config
 		command = [
@@ -61,7 +62,9 @@ class SdCli:
 		started = time.monotonic()
 		retries = c["memory_retries"]
 		for attempt in range(retries + 1):
-			self._wait_for_memory()
+			self._wait_for_memory(is_cancelled)
+			if is_cancelled():
+				raise GenerationError("Cancelled.")
 			try:
 				self._run(command, output)
 				break
@@ -78,10 +81,17 @@ class SdCli:
 			if self._process:
 				self._process.kill()
 
-	def _wait_for_memory(self):
+	def cancel(self):
+		"""Stop the photo being drawn now. It doesn't count as running out of memory."""
+		with self._lock:
+			if self._process:
+				self._cancelled = True
+				self._process.kill()
+
+	def _wait_for_memory(self, is_cancelled):
 		"""The last run's memory takes a while to come back, and starting early is what fails."""
 		deadline = time.monotonic() + self.config["memory_settle_seconds"]
-		while time.monotonic() < deadline and not self._stopping:
+		while time.monotonic() < deadline and not self._stopping and not is_cancelled():
 			if (_free_percent() or 100) >= self.config["memory_settle_free_percent"]:
 				return
 			time.sleep(5)
@@ -106,7 +116,10 @@ class SdCli:
 		finally:
 			with self._lock:
 				self._process = None
+				cancelled, self._cancelled = self._cancelled, False
 
+		if cancelled:
+			raise GenerationError("Cancelled.")
 		if process.returncode != 0 or not os.path.exists(output):
 			raise _failure(process.returncode, output_text)
 
