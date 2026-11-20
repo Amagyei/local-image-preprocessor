@@ -454,6 +454,169 @@ class Service(unittest.TestCase):
 	def test_cancelling_an_unknown_job_says_so(self):
 		self.assertEqual(self.request("DELETE", "/jobs/nothing")[0], 404)
 
+	# --- Batches: many jobs queued, watched and collected together -----------------------
+
+	def submit_batch(self, prompts=("One.", "Two.", "Three."), **extra):
+		body = {"init_images": [garment_photo()], "jobs": [{"prompt": p, "width": 768, "height": 1024} for p in prompts]}
+		body.update(extra)
+		return self.request("POST", "/batches", body)
+
+	def wait_for_batch(self, batch_id, status, seconds=15):
+		return self.wait_until(lambda: self.request("GET", f"/batches/{batch_id}")[1]["status"] == status, seconds)
+
+	def test_a_batch_is_accepted_at_once_and_drawn_in_order(self):
+		os.environ["FAKE_SLEEP"] = "0.2"
+		status, data = self.submit_batch(batch_id="shoot-1")
+		self.assertEqual(status, 202)
+		self.assertEqual((data["batch_id"], data["total"]), ("shoot-1", 3))
+		self.assertIn(data["status"], ("queued", "running"))
+		self.assertEqual(len({j["job_id"] for j in data["jobs"]}), 3)
+		self.assertTrue(self.wait_for_batch("shoot-1", "done"))
+		state = self.request("GET", "/batches/shoot-1")[1]
+		self.assertEqual(state["counts"], {"queued": 0, "running": 0, "done": 3, "failed": 0, "missing": 0})
+		self.assertTrue(state["finished"])
+		with open(self.calls) as f:
+			self.assertEqual([line.split()[0] for line in f], ["One.", "Two.", "Three."])
+
+	def test_the_photo_can_be_shared_or_replaced_per_job(self):
+		other = Image.new("RGB", (64, 64), (1, 2, 3))
+		buffer = io.BytesIO()
+		other.save(buffer, "PNG")
+		own = base64.b64encode(buffer.getvalue()).decode("ascii")
+		body = {
+			"init_images": [garment_photo()],
+			"jobs": [
+				{"prompt": "Shared.", "width": 768, "height": 1024},
+				{"prompt": "Shared.", "width": 768, "height": 1024, "init_images": [own]},
+			],
+		}
+		status, data = self.request("POST", "/batches", body)
+		self.assertEqual(status, 202)
+		self.assertEqual(data["total"], 2)  # the same words on a different photo are another drawing
+		self.assertEqual(self.request("POST", "/batches", {"jobs": [{"prompt": "x", "width": 768, "height": 1024}]})[0], 400)
+
+	def test_one_bad_job_refuses_the_whole_batch(self):
+		body = {"init_images": [garment_photo()], "jobs": [
+			{"prompt": "Fine.", "width": 768, "height": 1024},
+			{"prompt": "", "width": 768, "height": 1024},
+		]}
+		status, data = self.request("POST", "/batches", body)
+		self.assertEqual(status, 400)
+		self.assertIn("Job 2", data["error"])
+		self.assertEqual(self.request("GET", "/jobs")[1]["jobs"], [])
+		self.assertEqual(self.request("GET", "/batches")[1]["batches"], [])
+		self.assertEqual(self.call_count(), 0)
+
+	def test_a_grid_it_cannot_read_refuses_the_whole_batch(self):
+		status, data = self.submit_batch(("Fine.", "Four poses.\n\n" + LAYOUT_2X2))
+		self.assertEqual(status, 400)
+		self.assertIn("Job 2", data["error"])
+		self.assertEqual(self.request("GET", "/jobs")[1]["jobs"], [])
+
+	def test_batch_limits(self):
+		self.assertEqual(self.submit_batch(batch_id="no spaces")[0], 400)
+		self.assertEqual(self.request("POST", "/batches", {"jobs": []})[0], 400)
+		self.assertEqual(self.request("POST", "/batches", {"jobs": "x"})[0], 400)
+		self.assertEqual(self.request("POST", "/batches", {"jobs": ["x"]})[0], 400)
+		self.assertEqual(self.submit_batch(tuple(f"Photo {n}." for n in range(server.MAX_BATCH_JOBS + 1)))[0], 400)
+		self.assertEqual(self.request("GET", "/batches/nothing")[0], 404)
+		self.assertEqual(self.request("GET", "/batches/nothing/results")[0], 404)
+		self.assertEqual(self.request("DELETE", "/batches/nothing")[0], 404)
+
+	def test_a_batch_sent_again_draws_nothing_twice(self):
+		_, first = self.submit_batch(("One.", "One.", "Two."), batch_id="b")
+		self.assertEqual(first["total"], 2)  # the same drawing twice is one drawing
+		self.assertTrue(self.wait_for_batch("b", "done"))
+		_, again = self.submit_batch(("One.", "Two."), batch_id="b")
+		self.assertEqual([j["job_id"] for j in again["jobs"]], [j["job_id"] for j in first["jobs"]])
+		self.assertEqual(self.call_count(), 2)
+
+	def test_results_can_be_collected_while_the_rest_is_still_drawing(self):
+		os.environ["FAKE_SLEEP"] = "0.4"
+		_, data = self.submit_batch(("One.", "Two."), batch_id="b")
+		first = data["jobs"][0]["job_id"]
+		self.assertTrue(self.wait_for_status(first, "done"))
+		status, results = self.request("GET", "/batches/b/results")
+		self.assertEqual(status, 200)
+		self.assertEqual(list(results["images"]), [first])
+		self.assertEqual(results["pending"], 1)
+		self.assertEqual(results["order"], [j["job_id"] for j in data["jobs"]])
+		self.assertEqual(Image.open(io.BytesIO(base64.b64decode(results["images"][first]))).size, (768, 1024))
+		self.assertTrue(self.wait_for_batch("b", "done"))
+		self.assertEqual(len(self.request("GET", "/batches/b/results")[1]["images"]), 2)
+
+	def test_a_failed_job_leaves_the_rest_of_the_batch_drawn_and_a_retry_carries_on(self):
+		os.environ["FAKE_FAIL_ON"] = "Bad."
+		open(self.fail_flag + "-on", "w").close()  # only a prompt with "Bad." in it fails
+		_, data = self.submit_batch(("Good.", "Bad."), batch_id="b")
+		self.assertTrue(self.wait_for_batch("b", "failed"))
+		state = self.request("GET", "/batches/b")[1]
+		self.assertEqual((state["counts"]["done"], state["counts"]["failed"]), (1, 1))
+		bad = data["jobs"][1]["job_id"]
+		results = self.request("GET", "/batches/b/results")[1]
+		self.assertEqual((len(results["images"]), results["failed"], results["pending"]), (1, [bad], 0))
+		os.remove(self.fail_flag + "-on")
+		self.submit_batch(("Good.", "Bad."), batch_id="b")
+		self.assertTrue(self.wait_for_batch("b", "done"))
+		self.assertEqual(self.call_count(), 3)  # the good one wasn't drawn again
+
+	def test_a_batch_can_be_cancelled_whole(self):
+		os.environ["FAKE_SLEEP"] = "0.5"
+		_, data = self.submit_batch(batch_id="b")
+		_, other = self.submit_job("Not in the batch.")
+		self.assertEqual(self.request("DELETE", "/batches/b"), (200, {"removed": 3}))
+		self.assertEqual(self.request("GET", "/batches/b")[0], 404)
+		for job in data["jobs"]:
+			self.assertEqual(self.request("GET", f"/jobs/{job['job_id']}")[0], 404)
+			folder = os.path.join(self.service.jobs_root, job["job_id"])
+			self.assertTrue(self.wait_until(lambda: not os.path.exists(folder)))  # the running one is cleared once its process stops
+		self.assertTrue(self.wait_for_status(other["job_id"], "done"))  # the queue moved on to the other job
+
+	def test_batches_are_listed(self):
+		self.submit_batch(batch_id="a")
+		self.submit_batch(("Other.",), batch_id="b")
+		listed = self.request("GET", "/batches")[1]["batches"]
+		self.assertEqual([b["batch_id"] for b in listed], ["a", "b"])
+		self.assertEqual(listed[0]["total"], 3)
+		self.assertNotIn("jobs", listed[0])
+
+	def test_a_batch_without_an_id_gets_one(self):
+		_, data = self.submit_batch()
+		self.assertTrue(server.BATCH_ID.match(data["batch_id"]))
+		self.assertEqual(self.request("GET", f"/batches/{data['batch_id']}")[0], 200)
+
+	def test_a_batch_survives_a_restart(self):
+		config = dict(self.config, temp_dir=os.path.join(self.folder.name, "tmp3"), jobs_dir=os.path.join(self.folder.name, "jobs3"))
+		before = server.Service(config)
+		before.start()
+		batch_id, jobs = server.parse_batch(json.dumps({"batch_id": "b", "init_images": [garment_photo()], "jobs": [
+			{"prompt": "One.", "width": 768, "height": 1024}, {"prompt": "Two.", "width": 768, "height": 1024},
+		]}))
+		before.submit_batch(batch_id, jobs)
+		self.assertTrue(self.wait_until(lambda: before.batch_state("b")["status"] == "done"))
+
+		after = server.Service(config)
+		self.assertEqual(after.batch_state("b")["counts"]["done"], 2)
+		self.assertEqual(len(after.batch_results("b")["images"]), 2)
+
+	def test_a_batch_goes_once_its_jobs_are_gone(self):
+		_, data = self.submit_batch(("One.",), batch_id="b")
+		self.assertTrue(self.wait_for_batch("b", "done"))
+		path = os.path.join(self.service.batches_root, "b.json")
+		self.assertTrue(os.path.exists(path))
+		self.assertEqual(self.request("DELETE", f"/jobs/{data['jobs'][0]['job_id']}")[0], 200)
+		with self.service.lock:
+			self.service._prune()
+		self.assertEqual(self.request("GET", "/batches/b")[0], 404)
+		self.assertFalse(os.path.exists(path))
+
+	def test_batch_events_never_hold_prompts(self):
+		self.submit_batch(("A secret prompt.",), batch_id="b")
+		self.assertTrue(self.wait_for_batch("b", "done"))
+		events = self.request("GET", "/events?limit=100")[1]["events"]
+		self.assertIn("batch_queued", [e["kind"] for e in events])
+		self.assertNotIn("secret", json.dumps(events))
+
 	def test_a_failure_recording_a_failure_does_not_stop_the_queue(self):
 		real = self.service._write_meta
 

@@ -45,6 +45,47 @@ The laptop doesn't have to stay connected while a drawing runs.
 
 Jobs live in `runtime/jobs/<id>/` (`jobs_dir` in `config.json`). After a crash, restart or reboot the service picks up where it left off: finished drafts wait to be collected, queued and half-drawn jobs run again, keeping the photos already drawn. A draft nobody collects is deleted after `draft_retention_days` (30).
 
+### Batches: many drafts, handled together
+
+A batch is a group of drafts the laptop can send in one call, watch as one thing and collect when it likes. The Mac keeps drawing whether or not the laptop is connected; every job is saved to disk like any other draft.
+
+| Call | Does |
+|---|---|
+| `POST /batches` | Queues every job and answers `202` at once with the batch's state. |
+| `GET /batches` | Every batch: `status`, `total`, `counts`, `created`, `finished`. |
+| `GET /batches/{id}` | The same, plus each job's state (`job_id`, `status`, `progress`, `error`). |
+| `GET /batches/{id}/results` | `{"images": {job_id: base64 PNG}, "order", "pending", "failed"}` for the pictures that are ready, so a batch can be collected in part. |
+| `DELETE /batches/{id}` | Forgets the whole batch: stops what is running and deletes every job's photo and result. Answers `{"removed": n}`. |
+
+```json
+{"batch_id": "optional-name", "init_images": ["<base64 JPEG shared by every job>"],
+ "jobs": [{"prompt": "...", "width": 768, "height": 1024, "seed": 1}, {"prompt": "...", "width": 768, "height": 1024, "init_images": ["<this job's own photo>"]}]}
+```
+
+- Each job takes what `POST /jobs` takes. A shared `init_images` is sent once, and a job's own `init_images` replaces it.
+- Every job is checked before any is queued, so one bad job (the error says which, "Job 2: ...") refuses the whole batch and nothing is drawn.
+- A batch holds at most 50 jobs. `batch_id` is 1 to 64 letters, digits, `-` or `_`; leave it out and the Mac makes one.
+- Sending the same batch again queues nothing twice, and a job that failed carries on from its finished photos. The same drawing twice in a batch is one drawing. Jobs sent under an existing `batch_id` are added to it.
+- `status` is `queued` (nothing started), `running` (something is queued or drawing), `done` (every job drawn), `failed` (nothing left to draw and some didn't come out) or `empty` (every job has been removed).
+- Jobs still run one at a time, in the order they were sent. Batches are remembered across a restart, and one disappears once every job in it has been collected or has expired.
+- Events say `batch_queued` and `batch_removed` with the batch id and a count, never prompts.
+
+The jobs of a batch are ordinary drafts, so `/jobs`, `/jobs/{id}/result` and `DELETE /jobs/{id}` still work on them.
+
+### Reaching it from the laptop
+
+The laptop opens a tunnel to this Mac, and Studio's "Local Image Tool URL" is `http://127.0.0.1:7860` on the laptop. The tunnel only needs to be up when the laptop sends or collects; the Mac carries on without it.
+
+```bash
+ssh -N -L 7860:127.0.0.1:7860 user@this-mac
+```
+
+On this Mac, turn on Remote Login (System Settings, General, Sharing) and put the laptop's public key in `~/.ssh/authorized_keys`, limited to this one port:
+
+```
+restrict,port-forwarding,permitopen="127.0.0.1:7860" ssh-ed25519 AAAA... laptop
+```
+
 ## How it behaves
 
 - It runs one request at a time and queues the rest.
@@ -97,15 +138,3 @@ Tests use a stand-in for sd-cli, so they need no weights:
 ## Prompts
 
 `garment_instruction` in `config.json` adds the same line to every prompt, so it stays empty: not every garment is full length. Klein tends to shorten long garments, so Studio's form has a Garment length field that adds it to the prompt.
-
-## Reaching it from the shop server
-
-This Mac only draws images. It dials out to the shop server, so the server can use it as `http://127.0.0.1:7860` without any port being opened to the internet. The service itself still listens on `127.0.0.1` only.
-
-```bash
-TUNNEL_REMOTE=user@server ./install_tunnel_agent.sh          # makes ~/.ssh/image-host-tunnel and the launch agent; prints one authorized_keys line
-./install_tunnel_agent.sh --start                            # after the server has that line
-./install_tunnel_agent.sh --check                            # is it up
-```
-
-Put the server's host keys in `~/.ssh/image-host-known_hosts` first (`TUNNEL_KNOWN_HOSTS` points elsewhere); the tunnel refuses a server it doesn't recognise. The key is limited on the server to opening this one port, with no shell. Set "Local Image Tool URL" in Studio settings to `http://127.0.0.1:7860`.

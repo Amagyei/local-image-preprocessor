@@ -14,11 +14,13 @@ import logging
 import os
 import queue
 import random
+import re
 import shutil
 import signal
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -32,6 +34,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = "127.0.0.1"  # The laptop comes in over an SSH tunnel. Never listen wider than this.
 MAX_BODY = 64 * 1024 * 1024
 MAX_SIDE = 4096
+MAX_BATCH_JOBS = 50
+BATCH_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 log = logging.getLogger("local_image_server")
 
@@ -74,7 +78,11 @@ def parse_request(body):
 		raise BadRequest("The request wasn't valid JSON.")
 	if not isinstance(data, dict):
 		raise BadRequest("The request wasn't a JSON object.")
+	return job_from(data)
 
+
+def job_from(data):
+	"""Check one job's fields (already decoded) and return a Job. Raises BadRequest."""
 	prompt = data.get("prompt")
 	if not isinstance(prompt, str) or not prompt.strip():
 		raise BadRequest("The request has no prompt.")
@@ -108,6 +116,45 @@ def parse_request(body):
 	return Job(key, prompt, width, height, photo, seed)
 
 
+def parse_batch(body):
+	"""Check a batch and return (batch id, jobs). Raises BadRequest.
+
+	The body is {"batch_id": optional, "init_images": [shared photo], "jobs": [{...}, ...]}. Each job
+	is what POST /jobs takes; a job's own init_images replaces the shared photo. Every job is checked
+	before any is queued, so a bad one refuses the whole batch."""
+	try:
+		data = json.loads(body)
+	except ValueError:
+		raise BadRequest("The request wasn't valid JSON.")
+	if not isinstance(data, dict):
+		raise BadRequest("The request wasn't a JSON object.")
+	items = data.get("jobs")
+	if not isinstance(items, list) or not items:
+		raise BadRequest("Send a list of jobs.")
+	if len(items) > MAX_BATCH_JOBS:
+		raise BadRequest(f"A batch holds at most {MAX_BATCH_JOBS} jobs.")
+	batch_id = data.get("batch_id")
+	if batch_id is None:
+		batch_id = uuid.uuid4().hex[:16]
+	elif not isinstance(batch_id, str) or not BATCH_ID.match(batch_id):
+		raise BadRequest("The batch_id must be 1 to 64 letters, digits, - or _.")
+	shared = data.get("init_images")
+
+	jobs, seen = [], set()
+	for number, item in enumerate(items, start=1):
+		if not isinstance(item, dict):
+			raise BadRequest(f"Job {number} wasn't a JSON object.")
+		merged = {"batch_size": 1, **({"init_images": shared} if shared is not None else {}), **item}
+		try:
+			job = job_from(merged)
+		except BadRequest as e:
+			raise BadRequest(f"Job {number}: {e}")
+		if job.key not in seen:  # the same drawing twice is one drawing
+			seen.add(job.key)
+			jobs.append(job)
+	return batch_id, jobs
+
+
 class Service:
 	def __init__(self, config):
 		self.config = config
@@ -130,6 +177,10 @@ class Service:
 		# Drafts are the exception: they stay until the laptop collects them (or they age out).
 		self.jobs_root = config.get("jobs_dir") or os.path.join(os.path.dirname(self.temp_root), "jobs")
 		self._load_durable()
+		# A batch only remembers which jobs belong together; the jobs hold everything else.
+		self.batches_root = config.get("batches_dir") or os.path.join(os.path.dirname(self.jobs_root), "batches")
+		self.batches = {}
+		self._load_batches()
 
 	def start(self):
 		self.worker = threading.Thread(target=self._work, daemon=True)
@@ -358,6 +409,118 @@ class Service:
 			log.info("job=%s draft resumed after restart", job.key[:12])
 			self.observer.record("resumed", job.key)
 
+	# --- Batches: many jobs queued, watched and collected together ------------------------
+
+	def submit_batch(self, batch_id, jobs):
+		"""Queue every job as a draft and remember they belong together. Sending the same batch again
+		queues nothing twice; jobs that are new are added to it."""
+		for number, job in enumerate(jobs, start=1):
+			try:
+				panels_module.plan(job.prompt, job.width, job.height, self.config["max_long_side"])
+			except panels_module.PromptError as e:
+				raise panels_module.PromptError(f"Job {number}: {e}")
+		keys = [self.submit_durable(job).key for job in jobs]
+		with self.lock:
+			batch = self.batches.get(batch_id) or {"id": batch_id, "created": time.time(), "job_ids": []}
+			batch["job_ids"] += [key for key in keys if key not in batch["job_ids"]]
+			self.batches[batch_id] = batch
+			self._write_batch(batch)
+		self.observer.record("batch_queued", batch=batch_id, jobs=len(keys), waiting=self.queue.qsize())
+		return batch_id
+
+	def batch_state(self, batch_id):
+		batch = self.batches.get(batch_id)
+		if not batch:
+			return None
+		counts = {"queued": 0, "running": 0, "done": 0, "failed": 0, "missing": 0}
+		jobs = []
+		for key in list(batch["job_ids"]):
+			state = self.durable_state(key) or {"job_id": key, "status": "missing", "error": "The Mac no longer has this job."}
+			counts[state["status"]] += 1
+			jobs.append(state)
+		left = counts["queued"] + counts["running"]
+		if left:
+			status = "queued" if counts["queued"] == len(jobs) else "running"
+		elif counts["failed"]:
+			status = "failed"  # nothing is left to draw, and some didn't come out
+		elif counts["done"]:
+			status = "done"
+		else:
+			status = "empty"
+		finished = [j["finished"] for j in jobs if j.get("finished")]
+		return {
+			"batch_id": batch_id,
+			"status": status,
+			"total": len(jobs),
+			"counts": counts,
+			"created": batch["created"],
+			"finished": max(finished) if status in ("done", "failed") and finished else None,
+			"jobs": jobs,
+		}
+
+	def batch_list(self):
+		out = []
+		for batch_id in list(self.batches):
+			state = self.batch_state(batch_id)
+			if state:
+				out.append({k: state[k] for k in ("batch_id", "status", "total", "counts", "created", "finished")})
+		return sorted(out, key=lambda b: b["created"])
+
+	def batch_results(self, batch_id):
+		"""The pictures that are ready, by job id, so a batch can be collected in part."""
+		batch = self.batches.get(batch_id)
+		if not batch:
+			return None
+		images, pending, failed = {}, 0, []
+		for key in list(batch["job_ids"]):
+			image = self.durable_result(key)
+			state = self.durable_state(key)
+			if image:
+				images[key] = image
+			elif state and state["status"] == "failed":
+				failed.append(key)
+			elif state:
+				pending += 1
+		return {"batch_id": batch_id, "order": list(batch["job_ids"]), "images": images, "pending": pending, "failed": failed}
+
+	def batch_forget(self, batch_id):
+		"""Done with the whole batch: forget every job in it, photos and results too."""
+		with self.lock:
+			batch = self.batches.pop(batch_id, None)
+		if not batch:
+			return None
+		removed = sum(1 for key in batch["job_ids"] if self.durable_forget(key))
+		try:
+			os.remove(os.path.join(self.batches_root, f"{batch_id}.json"))
+		except OSError:
+			pass
+		self.observer.record("batch_removed", batch=batch_id, jobs=removed)
+		return removed
+
+	def _write_batch(self, batch):
+		try:
+			os.makedirs(self.batches_root, exist_ok=True)
+			path = os.path.join(self.batches_root, f"{batch['id']}.json")
+			with open(path + ".tmp", "w") as f:
+				json.dump(batch, f)
+			os.replace(path + ".tmp", path)
+		except OSError:
+			log.exception("batch=%s couldn't be written", batch["id"])
+
+	def _load_batches(self):
+		if not os.path.isdir(self.batches_root):
+			return
+		for name in os.listdir(self.batches_root):
+			if not name.endswith(".json"):
+				continue
+			try:
+				with open(os.path.join(self.batches_root, name)) as f:
+					batch = json.load(f)
+				if BATCH_ID.match(batch["id"]) and isinstance(batch["job_ids"], list):
+					self.batches[batch["id"]] = batch
+			except (OSError, ValueError, KeyError, TypeError):
+				continue
+
 	def health(self):
 		current = self.current
 		missing = self.engine.missing_files()
@@ -584,6 +747,13 @@ class Service:
 					self.observer.record("expired", key)
 			elif job.done.is_set() and job.finished_at is not None and job.finished_at < limit:
 				del self.jobs[key]
+		for batch_id, batch in list(self.batches.items()):
+			if not any(key in self.jobs for key in batch["job_ids"]):
+				del self.batches[batch_id]
+				try:
+					os.remove(os.path.join(self.batches_root, f"{batch_id}.json"))
+				except OSError:
+					pass
 		current = self.current.key if self.current else None
 		for key, kept in list(self.unfinished.items()):
 			if key != current and kept["at"] < limit:
@@ -622,6 +792,14 @@ def make_handler(service):
 				jobs = service.durable_list()
 				wanted = (query.get("status") or [None])[0]  # e.g. /jobs?status=running
 				self._send(200, {"jobs": [j for j in jobs if not wanted or j["status"] == wanted]})
+			elif parts == ["batches"]:
+				self._send(200, {"batches": service.batch_list()})
+			elif len(parts) == 2 and parts[0] == "batches":
+				state = service.batch_state(parts[1])
+				self._send(200, state) if state else self._send(404, {"error": "No such batch."})
+			elif len(parts) == 3 and parts[0] == "batches" and parts[2] == "results":
+				results = service.batch_results(parts[1])
+				self._send(200, results) if results else self._send(404, {"error": "No such batch."})
 			elif len(parts) == 2 and parts[0] == "jobs":
 				state = service.durable_state(parts[1])
 				self._send(200, state) if state else self._send(404, {"error": "No such job."})
@@ -656,11 +834,14 @@ def make_handler(service):
 					self._send(200, {"removed": True})
 				else:
 					self._send(404, {"error": "No job with that id."})
+			elif len(parts) == 2 and parts[0] == "batches":
+				removed = service.batch_forget(parts[1])
+				self._send(200, {"removed": removed}) if removed is not None else self._send(404, {"error": "No such batch."})
 			else:
 				self._send(404, {"error": "Not found."})
 
 		def do_POST(self):
-			if self.path not in ("/sdapi/v1/img2img", "/jobs"):
+			if self.path not in ("/sdapi/v1/img2img", "/jobs", "/batches"):
 				self._send(404, {"error": "Not found."})
 				return
 			try:
@@ -670,6 +851,17 @@ def make_handler(service):
 			if not 0 < length <= MAX_BODY:
 				self.close_connection = True
 				self._send(413 if length else 400, {"error": "The request was empty or over 64 MB."})
+				return
+
+			if self.path == "/batches":
+				try:
+					batch_id, jobs = parse_batch(self.rfile.read(length))
+					service.submit_batch(batch_id, jobs)
+				except (BadRequest, panels_module.PromptError) as e:
+					self._send(400, {"error": str(e)})
+					return
+				# Answer at once, like /jobs: the drawing goes on whether or not the laptop stays connected.
+				self._send(202, service.batch_state(batch_id))
 				return
 
 			queued = self.path == "/jobs"
