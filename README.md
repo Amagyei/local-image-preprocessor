@@ -24,6 +24,8 @@ Any request (`/sdapi/v1/img2img`, `/jobs`, or a job in `/batches`) can add:
 | `strength` | Above 0, at most 1 (default 1.0). Only with a mask. |
 | `keep_masked_pixels` | Default true: after drawing, the photo's own pixels are pasted back wherever the mask is black, with a 2 px soft edge, so the kept garment can't drift. |
 
+Or send `"canvas": "auto"` instead of a mask, with an optional `hem` (where the hem is, as a fraction of the photo's height). This Mac then maps the garment itself (`canvas_map.py`): it finds the garment, removes the dress form's knob, neck and pole, cuts everything below `hem` (the stand's base), puts the shot on a taller frame so there is room for a head and feet, and makes the mask. The map and canvas used are kept with the draft: `GET /jobs/{id}/map` and `GET /jobs/{id}/canvas`. This needs the extras, once: `.venv/bin/pip install -r requirements-canvas.txt` (rembg's isnet model, about 170 MB, downloads on first use). Without them the job fails and says so.
+
 sd-cli then gets `-i <photo> --mask <mask> --strength <s>` as well as the usual `-r <photo>`. Grid prompts still split into panels; each panel starts from the same photo and mask, scaled to the panel. A job's key only changes when a mask is sent, so plain requests keep the keys they had. The mask is kept on disk with the photo (`mask.bin`) until the drawing finishes. `/health` lists `"canvas"` in `features`.
 
 `GET /health` returns `model`, `ready`, `missing_files`, `loaded`, `busy`, `queue_length`, `progress`, `results_kept` and `features`. `loaded` and `busy` always match, because the model is only in memory during a run.

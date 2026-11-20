@@ -1,0 +1,4 @@
+# Only for "canvas": "auto" (the Mac maps the garment itself). Not needed otherwise.
+rembg[cpu]
+opencv-python-headless
+numpy

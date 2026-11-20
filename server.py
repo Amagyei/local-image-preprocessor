@@ -45,8 +45,11 @@ class BadRequest(Exception):
 
 
 class Job:
-	def __init__(self, key, prompt, width, height, photo, seed=None, mask=None, strength=None, keep_masked=True):
+	def __init__(self, key, prompt, width, height, photo, seed=None, mask=None, strength=None, keep_masked=True,
+			auto_canvas=False, hem=None):
 		self.key = key
+		self.auto_canvas = auto_canvas  # map the garment here and build the mask (canvas_map.py)
+		self.hem = hem  # where the hem is, as a fraction of the photo's height; below it goes
 		self.mask = mask  # canvas mode: white = draw here, black = keep the photo's pixels
 		self.strength = strength
 		self.keep_masked = keep_masked  # paste the photo's own pixels back where the mask is black
@@ -114,21 +117,43 @@ def job_from(data):
 	if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**31):
 		raise BadRequest("The seed must be a whole number from 0 to 2147483647.")
 
-	mask, strength, keep_masked = _canvas_fields(data, photo)
+	auto, hem = _auto_fields(data)
+	mask, strength, keep_masked = _canvas_fields(data, photo, auto)
 
 	fingerprint = [prompt, width, height] + ([seed] if seed is not None else [])
 	if mask is not None:  # only canvas jobs carry these, so earlier keys stay the same
 		fingerprint.append({"mask": hashlib.sha256(mask).hexdigest(), "strength": strength, "keep": keep_masked})
+	elif auto:
+		fingerprint.append({"canvas": "auto", "hem": hem, "strength": strength, "keep": keep_masked})
 	key = hashlib.sha256(json.dumps(fingerprint).encode() + hashlib.sha256(photo).digest()).hexdigest()
-	return Job(key, prompt, width, height, photo, seed, mask, strength, keep_masked)
+	return Job(key, prompt, width, height, photo, seed, mask, strength, keep_masked, auto, hem)
 
 
-def _canvas_fields(data, photo):
+def _auto_fields(data):
+	"""{"canvas": "auto", "hem": 0-1}: this Mac maps the garment and makes the mask itself."""
+	canvas = data.get("canvas")
+	if canvas is None:
+		if "hem" in data:
+			raise BadRequest("hem only applies with \"canvas\": \"auto\".")
+		return False, None
+	if canvas != "auto":
+		raise BadRequest('canvas must be "auto" (or send your own mask instead).')
+	if "mask" in data:
+		raise BadRequest('Send a mask or "canvas": "auto", not both.')
+	hem = data.get("hem")
+	if hem is not None and (not isinstance(hem, (int, float)) or isinstance(hem, bool) or not 0 < hem <= 1):
+		raise BadRequest("hem is where the hem is, as a fraction of the photo's height: above 0, at most 1.")
+	return True, (float(hem) if hem is not None else None)
+
+
+def _canvas_fields(data, photo, auto=False):
 	"""Optional canvas mode: {"mask": base64 PNG, "strength": 0-1, "keep_masked_pixels": bool}.
 
 	The mask is the size of the photo: white where the model draws, black where the photo stays.
 	Returns (mask bytes or None, strength, keep_masked)."""
 	raw = data.get("mask")
+	if raw is None and auto:
+		return None, *_canvas_options(data)
 	if raw is None:
 		for field in ("strength", "keep_masked_pixels"):
 			if field in data:
@@ -150,13 +175,17 @@ def _canvas_fields(data, photo):
 		raise BadRequest(f"The mask is {m_size[0]}x{m_size[1]} but the photo is {p_size[0]}x{p_size[1]}; they must match.")
 	if extrema[1] < 128:
 		raise BadRequest("The mask has no white area, so there is nothing to draw.")
+	return mask, *_canvas_options(data)
+
+
+def _canvas_options(data):
 	strength = data.get("strength", 1.0)
 	if not isinstance(strength, (int, float)) or isinstance(strength, bool) or not 0 < strength <= 1:
 		raise BadRequest("The strength must be a number above 0 and at most 1.")
 	keep = data.get("keep_masked_pixels", True)
 	if not isinstance(keep, bool):
 		raise BadRequest("keep_masked_pixels must be true or false.")
-	return mask, float(strength), keep
+	return float(strength), keep
 
 
 def parse_batch(body):
@@ -404,7 +433,8 @@ class Service:
 			"started": job.started_wall, "panels": job.panel_total, "run_seconds": job.run_seconds,
 			"panel_seconds": {str(n): t for n, t in job.panel_seconds.items()},
 			"panel_prompts": {str(n): t for n, t in job.panel_prompts.items()},
-			"canvas": job.mask is not None, "strength": job.strength, "keep_masked": job.keep_masked,
+			"canvas": "auto" if job.auto_canvas else job.mask is not None, "hem": job.hem,
+			"strength": job.strength, "keep_masked": job.keep_masked,
 		})
 		if seed is not None:
 			meta["seed"] = seed
@@ -438,11 +468,12 @@ class Service:
 			except (OSError, ValueError):
 				shutil.rmtree(folder, ignore_errors=True)
 				continue
-			if meta.get("canvas") and mask is None and meta.get("state") != "done":
+			auto = meta.get("canvas") == "auto"
+			if meta.get("canvas") is True and mask is None and meta.get("state") != "done":
 				photo = None  # a canvas job without its mask can't be drawn as asked
 			job = Job(
 				key, meta["prompt"], meta["width"], meta["height"], photo, meta.get("requested_seed"),
-				mask, meta.get("strength"), meta.get("keep_masked", True),
+				mask, meta.get("strength"), meta.get("keep_masked", True), auto, meta.get("hem"),
 			)
 			job.durable, job.folder = True, folder
 			job.created, job.finished_wall = meta.get("created", time.time()), meta.get("finished")
@@ -707,7 +738,11 @@ class Service:
 		try:
 			reference = os.path.join(folder, "reference.png")
 			_save_reference(job.photo, reference, c["reference_long_side"])
-			canvas_source = _open_canvas(job.photo, job.mask) if job.mask is not None else None
+			canvas_source = None
+			if job.mask is not None:
+				canvas_source = _open_canvas(job.photo, job.mask)
+			elif job.auto_canvas:
+				canvas_source = self._auto_canvas(job)
 
 			canvas = Image.new("RGB", (job.width, job.height))
 			for panel in plan:
@@ -774,6 +809,33 @@ class Service:
 			return base64.b64encode(buffer.getvalue()).decode("ascii")
 		finally:
 			shutil.rmtree(folder, ignore_errors=True)
+
+	def _auto_canvas(self, job):
+		"""Map the garment and build the canvas and mask. Kept with a draft as map.png and canvas.png."""
+		try:
+			import canvas_map
+			canvas, mask, garment = canvas_map.build(job.photo, job.width, job.height, job.hem)
+		except ImportError:
+			raise GenerationError('"canvas": "auto" needs the extras: .venv/bin/pip install -r requirements-canvas.txt')
+		except Exception as e:  # noqa: BLE001 — becomes the job's error
+			raise GenerationError(f"Couldn't map the garment: {e}")
+		if job.durable:
+			garment.save(os.path.join(job.folder, "map.png"))
+			canvas.save(os.path.join(job.folder, "canvas.png"))
+		histogram = garment.convert("L").histogram()
+		self.observer.record("mapped", job.key, garment_pct=round(100 * sum(histogram[128:]) / max(sum(histogram), 1), 1))
+		return canvas.convert("RGB"), mask.convert("L")
+
+	def durable_map(self, key, name):
+		"""The garment map or canvas a canvas-auto draft was drawn from, or None."""
+		job = self.jobs.get(key)
+		if not job or not job.durable or name not in ("map", "canvas"):
+			return None
+		try:
+			with open(os.path.join(job.folder, f"{name}.png"), "rb") as f:
+				return "image/png", f.read()
+		except OSError:
+			return None
 
 	def _saved_progress(self, job):
 		"""Seed and finished photos a draft saved before a restart."""
@@ -913,6 +975,9 @@ def make_handler(service):
 					self._send_bytes(*picture)
 				else:
 					self._send(404, {"error": "No finished picture for that job."})
+			elif len(parts) == 3 and parts[0] == "jobs" and parts[2] in ("map", "canvas"):
+				picture = service.durable_map(parts[1], parts[2])
+				self._send_bytes(*picture) if picture else self._send(404, {"error": "No map for that job."})
 			elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "result":
 				state = service.durable_state(parts[1])
 				image = service.durable_result(parts[1])

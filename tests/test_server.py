@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -955,3 +955,94 @@ class Canvas(unittest.TestCase):
 		data = json.loads(response.read())
 		connection.close()
 		return response.status, data
+
+
+class AutoCanvas(unittest.TestCase):
+	""""canvas": "auto": the Mac maps the garment itself. The mapper is stubbed here."""
+
+	post, health, wait_until = Service.post, Service.health, Service.wait_until
+	last_args = Canvas.last_args
+
+	def setUp(self):
+		Service.setUp(self)
+		self.args = os.path.join(self.folder.name, "args.jsonl")
+		os.environ["FAKE_ARGS"] = self.args
+		self.addCleanup(os.environ.pop, "FAKE_ARGS", None)
+		self.photo = solid((768, 1024), (10, 120, 60))
+		self.calls_to_map = []
+
+		def build(photo, width, height, hem=None):
+			self.calls_to_map.append((width, height, hem))
+			canvas = Image.new("RGB", (width, height), (10, 120, 60))
+			draw = Image.new("L", (width, height), 0)
+			draw.paste(255, (width // 2, 0, width, height))
+			return canvas, draw, ImageOps.invert(draw)
+
+		fake = type(sys)("canvas_map")
+		fake.build = build
+		sys.modules["canvas_map"] = fake
+		self.addCleanup(sys.modules.pop, "canvas_map", None)
+
+	def submit(self, **extra):
+		body = {"prompt": "A photo.", "init_images": [self.photo], "width": 768, "height": 1024, "canvas": "auto", **extra}
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+		connection.request("POST", "/jobs", json.dumps(body), {"Content-Type": "application/json"})
+		response = connection.getresponse()
+		data = json.loads(response.read())
+		connection.close()
+		return response.status, data
+
+	def get(self, path):
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+		connection.request("GET", path)
+		response = connection.getresponse()
+		body = response.read()
+		connection.close()
+		return response.status, body
+
+	def wait_done(self, job_id):
+		return self.wait_until(lambda: json.loads(self.get(f"/jobs/{job_id}")[1]).get("status") in ("done", "failed"))
+
+	def test_maps_then_draws_in_canvas_mode(self):
+		status, data = self.submit(hem=0.85)
+		self.assertEqual(status, 202, data)
+		self.assertTrue(self.wait_done(data["job_id"]))
+		self.assertEqual(json.loads(self.get(f"/jobs/{data['job_id']}")[1])["status"], "done")
+		self.assertEqual(self.calls_to_map, [(768, 1024, 0.85)])
+		args = self.last_args()
+		self.assertIn("--mask", args)
+		self.assertIn("-i", args)
+
+	def test_map_and_canvas_can_be_fetched(self):
+		_, data = self.submit()
+		self.wait_done(data["job_id"])
+		for name in ("map", "canvas"):
+			status, body = self.get(f"/jobs/{data['job_id']}/{name}")
+			self.assertEqual(status, 200)
+			self.assertEqual(Image.open(io.BytesIO(body)).size, (768, 1024))
+
+	def test_hem_is_part_of_the_job(self):
+		a = server.job_from({"prompt": "A.", "init_images": [self.photo], "width": 768, "height": 1024, "canvas": "auto"})
+		b = server.job_from({"prompt": "A.", "init_images": [self.photo], "width": 768, "height": 1024, "canvas": "auto", "hem": 0.8})
+		plain = server.job_from({"prompt": "A.", "init_images": [self.photo], "width": 768, "height": 1024})
+		self.assertEqual(len({a.key, b.key, plain.key}), 3)
+
+	def test_bad_auto_requests_are_refused(self):
+		base = {"prompt": "A.", "init_images": [self.photo], "width": 768, "height": 1024}
+		for name, extra in {
+			"hem without canvas": {"hem": 0.5},
+			"unknown canvas": {"canvas": "magic"},
+			"auto and a mask": {"canvas": "auto", "mask": half_mask((768, 1024))},
+			"hem out of range": {"canvas": "auto", "hem": 1.5},
+		}.items():
+			with self.subTest(name):
+				with self.assertRaises(server.BadRequest):
+					server.job_from({**base, **extra})
+
+	def test_without_the_extras_the_job_fails_clearly(self):
+		sys.modules["canvas_map"] = None  # import fails
+		_, data = self.submit()
+		self.wait_done(data["job_id"])
+		state = json.loads(self.get(f"/jobs/{data['job_id']}")[1])
+		self.assertEqual(state["status"], "failed")
+		self.assertIn("requirements-canvas.txt", state["error"])
