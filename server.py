@@ -20,11 +20,13 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 import panels as panels_module
-from engine import GenerationError, SdCli
+from engine import GenerationError, SdCli, _free_percent
+from observe import Observer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = "127.0.0.1"  # The laptop comes in over an SSH tunnel. Never listen wider than this.
@@ -47,6 +49,11 @@ class Job:
 		self.folder = None
 		self.created = time.time()
 		self.finished_wall = None
+		self.started_wall = None  # when the latest attempt began drawing
+		self.panel_total = None
+		self.panel_seconds = {}  # draw time of each photo, by number
+		self.panel_prompts = {}  # what each photo was really drawn from, by number
+		self.run_seconds = None
 		self.prompt = prompt
 		self.width = width
 		self.height = height
@@ -110,7 +117,14 @@ class Service:
 		self.jobs = {}
 		self.unfinished = {}  # photos already drawn for requests that failed part way
 		self.current = None
+		self.current_since = None
 		self.temp_root = config["temp_dir"]
+		self.started = time.time()
+		self.observer = Observer(config.get("events_file") or os.path.join(os.path.dirname(self.temp_root), "events.jsonl"))
+		self.observer.record("startup", model=config["model_name"])
+		self.worker = None
+		self.current_since = None
+		self._memory = (0, None)  # when the free memory was last read, and what it was
 		# Anything here was left by a crash, and it's the customer's photos.
 		shutil.rmtree(self.temp_root, ignore_errors=True)
 		# Drafts are the exception: they stay until the laptop collects them (or they age out).
@@ -118,7 +132,8 @@ class Service:
 		self._load_durable()
 
 	def start(self):
-		threading.Thread(target=self._work, daemon=True).start()
+		self.worker = threading.Thread(target=self._work, daemon=True)
+		self.worker.start()
 		threading.Thread(target=self._prune_forever, daemon=True).start()
 
 	def submit(self, job):
@@ -133,6 +148,7 @@ class Service:
 			self.jobs[job.key] = job
 			self.queue.put(job)
 			log.info("job=%s queued size=%sx%s waiting=%s", job.key[:12], job.width, job.height, self.queue.qsize())
+			self.observer.record("queued", job.key, size=f"{job.width}x{job.height}", waiting=self.queue.qsize() - 1, durable=False)
 			return job
 
 	# --- Jobs that outlive the connection, a crash and a restart -------------------------
@@ -150,6 +166,7 @@ class Service:
 					existing.done.clear()
 					self._write_meta(existing, "queued")
 					self.queue.put(existing)
+					self.observer.record("requeued", existing.key, waiting=self.queue.qsize() - 1)
 				return existing
 			if existing:  # a plain request is already running or kept: leave it be
 				return existing
@@ -162,6 +179,7 @@ class Service:
 			self.jobs[job.key] = job
 			self.queue.put(job)
 			log.info("job=%s draft queued waiting=%s", job.key[:12], self.queue.qsize())
+			self.observer.record("queued", job.key, size=f"{job.width}x{job.height}", waiting=self.queue.qsize() - 1, durable=True)
 			return job
 
 	def durable_state(self, key):
@@ -178,8 +196,46 @@ class Service:
 			"progress": job.progress if job is self.current else None,
 			"error": job.error,
 			"created": job.created,
+			"started": job.started_wall,
 			"finished": job.finished_wall,
+			"run_seconds": job.run_seconds,
+			"panels": job.panel_total,
 		}
+
+	def durable_detail(self, key):
+		"""Everything the status page shows when a job is opened, including the prompt."""
+		state = self.durable_state(key)
+		if not state:
+			return None
+		job = self.jobs[key]
+		try:
+			with open(os.path.join(job.folder, "meta.json")) as f:
+				meta = json.load(f)
+		except (OSError, ValueError):
+			meta = {}
+		state.update({
+			"prompt": job.prompt, "width": job.width, "height": job.height,
+			"seed": meta.get("seed"), "steps": self.config["steps"],
+			"panel_prompts": {str(n): t for n, t in sorted(job.panel_prompts.items())},
+			"events": self.observer.timeline(key),
+			"panel_seconds": {str(n): t for n, t in sorted(job.panel_seconds.items())},
+			"panel_files": sorted(
+				int(name[6:-4]) for name in os.listdir(job.folder)
+				if name.startswith("panel-") and name.endswith(".png")
+			) if job.folder and os.path.isdir(job.folder) else [],
+			"has_result": os.path.exists(os.path.join(job.folder, "result.png")),
+		})
+		return state
+
+	def durable_panel(self, key, number):
+		job = self.jobs.get(key)
+		if not job or not job.durable or not job.done.is_set() or job.status != 200:
+			return None
+		try:
+			with open(os.path.join(job.folder, f"panel-{int(number)}.png"), "rb") as f:
+				return "image/png", f.read()
+		except (OSError, ValueError):
+			return None
 
 	def durable_list(self):
 		return [self.durable_state(key) for key, job in list(self.jobs.items()) if job.durable]
@@ -205,7 +261,26 @@ class Service:
 			self.unfinished.pop(key, None)
 			shutil.rmtree(job.folder, ignore_errors=True)
 		log.info("job=%s removed", key[:12])
+		self.observer.record("removed", key, running=running)
 		return True
+
+	def durable_picture(self, key, thumb=False):
+		"""(content type, bytes) of a finished draft for the status page, or None."""
+		job = self.jobs.get(key)
+		if not job or not job.durable or not job.done.is_set() or job.status != 200:
+			return None
+		try:
+			with open(os.path.join(job.folder, "result.png"), "rb") as f:
+				data = f.read()
+			if not thumb:
+				return "image/png", data
+			with Image.open(io.BytesIO(data)) as image:
+				image.thumbnail((320, 320))
+				out = io.BytesIO()
+				image.convert("RGB").save(out, "JPEG", quality=80)
+			return "image/jpeg", out.getvalue()
+		except OSError:
+			return None
 
 	def image_of(self, job):
 		if job.image:
@@ -229,6 +304,9 @@ class Service:
 		meta.update({
 			"prompt": job.prompt, "width": job.width, "height": job.height, "requested_seed": job.seed,
 			"created": job.created, "state": state, "error": job.error, "finished": job.finished_wall,
+			"started": job.started_wall, "panels": job.panel_total, "run_seconds": job.run_seconds,
+			"panel_seconds": {str(n): t for n, t in job.panel_seconds.items()},
+			"panel_prompts": {str(n): t for n, t in job.panel_prompts.items()},
 		})
 		if seed is not None:
 			meta["seed"] = seed
@@ -262,6 +340,10 @@ class Service:
 			job = Job(key, meta["prompt"], meta["width"], meta["height"], photo, meta.get("requested_seed"))
 			job.durable, job.folder = True, folder
 			job.created, job.finished_wall = meta.get("created", time.time()), meta.get("finished")
+			job.started_wall, job.panel_total = meta.get("started"), meta.get("panels")
+			job.run_seconds = meta.get("run_seconds")
+			job.panel_seconds = {int(n): t for n, t in (meta.get("panel_seconds") or {}).items()}
+			job.panel_prompts = {int(n): t for n, t in (meta.get("panel_prompts") or {}).items()}
 			if meta.get("state") == "done" and os.path.exists(os.path.join(folder, "result.png")):
 				job.status, job.finished_at = 200, time.monotonic()
 				job.done.set()
@@ -274,12 +356,14 @@ class Service:
 		for job in sorted(found, key=lambda j: j.created):
 			self.queue.put(job)
 			log.info("job=%s draft resumed after restart", job.key[:12])
+			self.observer.record("resumed", job.key)
 
 	def health(self):
 		current = self.current
 		missing = self.engine.missing_files()
 		return {
 			"model": self.config["model_name"],
+			"uptime_seconds": round(time.time() - self.started),
 			"ready": not missing,
 			"missing_files": [os.path.basename(path) for path in missing],
 			# The model only sits in memory during a run, see engine.py.
@@ -287,9 +371,32 @@ class Service:
 			"busy": bool(current),
 			"queue_length": self.queue.qsize(),
 			"progress": current.progress if current else None,
+			"worker_alive": self.worker.is_alive() if self.worker else None,
+			"running_seconds": round(time.monotonic() - self.current_since) if current and self.current_since else None,
 			"results_kept": sum(1 for job in list(self.jobs.values()) if job.done.is_set()),
 			"drafts_waiting": sum(1 for job in list(self.jobs.values()) if job.durable and job.done.is_set() and job.status == 200),
 		}
+
+	def metrics(self):
+		"""The health strip: history from the event log, plus what is true right now."""
+		data = self.observer.stats()
+		size, count = 0, 0
+		for folder, _, names in os.walk(self.jobs_root):
+			if folder != self.jobs_root:
+				count += 1
+			for name in names:
+				try:
+					size += os.path.getsize(os.path.join(folder, name))
+				except OSError:
+					pass
+		read_at, free = self._memory
+		if time.monotonic() - read_at > 15:
+			free = _free_percent()
+			self._memory = (time.monotonic(), free)
+		data["now"] = self.health()
+		data["disk"] = {"jobs": count, "jobs_bytes": size}
+		data["memory_free_percent"] = free
+		return data
 
 	def stop(self):
 		self.engine.stop()
@@ -300,20 +407,25 @@ class Service:
 			job = self.queue.get()
 			with self.lock:
 				if job.cancelled:
+					self.observer.record("cancelled", job.key, stage="queued")
 					continue
 				self.current = job
+				self.current_since = time.monotonic()
 			try:
 				image = self._run(job)
 				job.finished_wall = time.time()
+				job.run_seconds = round(sum(job.panel_seconds.values()), 1)
 				if job.durable:
 					self._save_result(job, image)
 					self._write_meta(job, "done")
-					for name in os.listdir(job.folder):  # the photo and half-way panels aren't needed now
-						if name == "photo.bin" or name.startswith("panel-"):
-							os.remove(os.path.join(job.folder, name))
+					# The garment photo isn't needed now. The drawn photos stay, so a grid can be
+					# looked at one photo at a time until it's collected.
+					if os.path.exists(os.path.join(job.folder, "photo.bin")):
+						os.remove(os.path.join(job.folder, "photo.bin"))
 				else:
 					job.image = image
 				job.status = 200
+				self.observer.record("finished", job.key, seconds=job.run_seconds, panels=job.panel_total)
 			except GenerationError as e:
 				self._fail(job, 500, str(e))
 			except panels_module.PromptError as e:
@@ -335,6 +447,10 @@ class Service:
 
 	def _fail(self, job, status, message):
 		log.error("job=%s failed: %s", job.key[:12], message)
+		if job.cancelled:
+			self.observer.record("cancelled", job.key, stage="drawing")
+		else:
+			self.observer.record("failed", job.key, error=message[:200], status=status, panel=job.progress)
 		job.status, job.error = status, message
 		if job.durable:
 			# Kept, with its finished photos, so the laptop sees the failure and a retry carries on.
@@ -365,6 +481,9 @@ class Service:
 		folder = os.path.join(self.temp_root, job.key[:12])
 		os.makedirs(folder, exist_ok=True)
 		started = time.monotonic()
+		job.started_wall = time.time()
+		job.panel_total = len(plan)
+		self.observer.record("started", job.key, waited=round(job.started_wall - job.created, 1), panels=len(plan), kept=len(kept["panels"]), seed=seed)
 		try:
 			reference = os.path.join(folder, "reference.png")
 			_save_reference(job.photo, reference, c["reference_long_side"])
@@ -377,21 +496,30 @@ class Service:
 				left, top, right, bottom = panel.box
 				if panel.number in kept["panels"]:
 					log.info("job=%s photo=%s/%s kept from the last try", job.key[:12], panel.number, len(plan))
+					self.observer.record("panel_kept", job.key, panel=panel.number)
 					canvas.paste(Image.open(io.BytesIO(kept["panels"][panel.number])), (left, top))
 					continue
 				output = os.path.join(folder, f"panel-{panel.number}.png")
+				effective = f"{panel.prompt}\n\n{c['garment_instruction']}".strip()
+				job.panel_prompts[panel.number] = effective
 				try:
 					seconds = self.engine.generate(
-						prompt=f"{panel.prompt}\n\n{c['garment_instruction']}".strip(),
+						prompt=effective,
 						reference=reference,
 						width=panel.draw_size[0],
 						height=panel.draw_size[1],
 						seed=seed,
 						output=output,
 						is_cancelled=lambda: job.cancelled,
+						on_event=lambda kind, **fields: self.observer.record(kind, job.key, panel=panel.number, **fields),
 					)
 				except GenerationError as e:
 					raise GenerationError(f"Photo {panel.number} of {len(plan)}: {e}")
+				job.panel_seconds[panel.number] = round(seconds, 1)
+				self.observer.record(
+					"panel_done", job.key, panel=panel.number, seconds=round(seconds, 1), size=f"{panel.draw_size[0]}x{panel.draw_size[1]}",
+					words=len(effective.split()), steps=c["steps"], cfg=c["cfg_scale"],
+				)
 				log.info(
 					"job=%s photo=%s/%s draw=%sx%s seed=%s steps=%s cfg=%s words=%s seconds=%.1f",
 					job.key[:12], panel.number, len(plan), *panel.draw_size,
@@ -408,6 +536,7 @@ class Service:
 				if job.durable:
 					with open(os.path.join(job.folder, f"panel-{panel.number}.png"), "wb") as f:
 						f.write(kept["panels"][panel.number])
+					self._write_meta(job, "running")
 
 			self.unfinished.pop(job.key, None)
 			buffer = io.BytesIO()
@@ -452,6 +581,7 @@ class Service:
 					del self.jobs[key]
 					shutil.rmtree(job.folder, ignore_errors=True)
 					log.info("job=%s draft expired uncollected", key[:12])
+					self.observer.record("expired", key)
 			elif job.done.is_set() and job.finished_at is not None and job.finished_at < limit:
 				del self.jobs[key]
 		current = self.current.key if self.current else None
@@ -473,14 +603,40 @@ def make_handler(service):
 		timeout = None
 
 		def do_GET(self):
-			parts = self.path.strip("/").split("/")
-			if self.path == "/health":
+			url = urlparse(self.path)
+			query = parse_qs(url.query)
+			parts = url.path.strip("/").split("/")
+			if self.path in ("/", "/ui"):
+				self._send_page()
+			elif self.path == "/health":
 				self._send(200, service.health())
+			elif url.path == "/metrics":
+				self._send(200, service.metrics())
+			elif url.path == "/events":
+				try:
+					limit = int((query.get("limit") or [100])[0])
+				except ValueError:
+					limit = 100
+				self._send(200, {"events": service.observer.recent(limit, (query.get("job") or [None])[0])})
 			elif parts == ["jobs"]:
-				self._send(200, {"jobs": service.durable_list()})
+				jobs = service.durable_list()
+				wanted = (query.get("status") or [None])[0]  # e.g. /jobs?status=running
+				self._send(200, {"jobs": [j for j in jobs if not wanted or j["status"] == wanted]})
 			elif len(parts) == 2 and parts[0] == "jobs":
 				state = service.durable_state(parts[1])
 				self._send(200, state) if state else self._send(404, {"error": "No such job."})
+			elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "detail":
+				detail = service.durable_detail(parts[1])
+				self._send(200, detail) if detail else self._send(404, {"error": "No such job."})
+			elif len(parts) == 4 and parts[0] == "jobs" and parts[2] == "panel":
+				picture = service.durable_panel(parts[1], parts[3])
+				self._send_bytes(*picture) if picture else self._send(404, {"error": "No such photo."})
+			elif len(parts) == 3 and parts[0] == "jobs" and parts[2] in ("image", "thumb"):
+				picture = service.durable_picture(parts[1], thumb=parts[2] == "thumb")
+				if picture:
+					self._send_bytes(*picture)
+				else:
+					self._send(404, {"error": "No finished picture for that job."})
 			elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "result":
 				state = service.durable_state(parts[1])
 				image = service.durable_result(parts[1])
@@ -540,6 +696,34 @@ def make_handler(service):
 			else:
 				self._send(job.status or 500, {"error": job.error or "The run didn't produce an image."})
 
+		def _send_bytes(self, content_type, body):
+			try:
+				self.send_response(200)
+				self.send_header("Content-Type", content_type)
+				self.send_header("Content-Length", str(len(body)))
+				self.send_header("Cache-Control", "private, max-age=3600")
+				self.end_headers()
+				self.wfile.write(body)
+			except OSError:
+				self.close_connection = True
+
+		def _send_page(self):
+			"""The status page: a read-only view of /health and /jobs, no photos or prompts."""
+			try:
+				with open(os.path.join(HERE, "status.html"), "rb") as f:
+					body = f.read()
+			except OSError:
+				self._send(404, {"error": "Not found."})
+				return
+			try:
+				self.send_response(200)
+				self.send_header("Content-Type", "text/html; charset=utf-8")
+				self.send_header("Content-Length", str(len(body)))
+				self.end_headers()
+				self.wfile.write(body)
+			except OSError:
+				self.close_connection = True
+
 		def _send(self, status, payload):
 			body = json.dumps(payload).encode()
 			try:
@@ -553,7 +737,13 @@ def make_handler(service):
 				log.info("the client left before the answer; a retry will get the kept result")
 
 		def log_message(self, format, *args):
-			log.info("%s %s", self.address_string(), format % args)
+			line = format % args
+			# The status page asks every few seconds; keep those out of the log.
+			if line.startswith(("GET /health ", "GET /metrics ", "GET /events", "GET /jobs HTTP", "GET /jobs?", "GET / HTTP", "GET /ui ")) and line.endswith(" 200 -"):
+				return
+			if line.startswith("GET /jobs/") and line.endswith((" 200 -", " 304 -")) and ("/thumb " in line or "/image " in line or "/panel/" in line or "/detail " in line):
+				return
+			log.info("%s %s", self.address_string(), line)
 
 	return Handler
 

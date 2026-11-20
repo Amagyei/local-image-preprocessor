@@ -2,3 +2,5 @@ runtime/
 .venv/
 __pycache__/
 *.log
+amagyei-github
+amagyei-github.pub

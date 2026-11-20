@@ -1,0 +1,246 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image server</title>
+<style>
+	:root { color-scheme: light dark; --ok: #2e9e5b; --busy: #d98a00; --bad: #cf3b3b; --mute: #8a8a8a; }
+	body { font: 15px/1.4 -apple-system, system-ui, sans-serif; max-width: 880px; margin: 24px auto; padding: 0 16px; }
+	h1 { font-size: 18px; margin: 0 0 4px; display: flex; align-items: center; gap: 8px; }
+	.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--mute); display: inline-block; }
+	.sub { color: var(--mute); font-size: 13px; margin-bottom: 16px; }
+	.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 20px; }
+	.card { border: 1px solid #8884; border-radius: 8px; padding: 10px 12px; }
+	.card b { display: block; font-size: 22px; }
+	.card span { color: var(--mute); font-size: 12px; }
+	table { width: 100%; border-collapse: collapse; font-size: 14px; }
+	th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #8883; }
+	th { color: var(--mute); font-weight: 500; font-size: 12px; }
+	.badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; background: var(--mute); }
+	.badge.running { background: var(--busy); } .badge.done { background: var(--ok); } .badge.failed { background: var(--bad); }
+	.thumb { width: 56px; height: 74px; object-fit: cover; border-radius: 4px; background: #8882; display: block; }
+	tbody tr.job { cursor: pointer; }
+	tbody tr.job:hover { background: #8881; }
+	dialog { width: min(920px, 94vw); max-height: 92vh; border: 1px solid #8886; border-radius: 12px; padding: 16px 18px; }
+	dialog::backdrop { background: #0008; }
+	.dhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+	.dhead button { font: inherit; padding: 2px 10px; }
+	.dgrid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+	@media (max-width: 640px) { .dgrid { grid-template-columns: 1fr; } }
+	.dgrid img { width: 100%; border-radius: 6px; display: block; background: #8882; }
+	.panels { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; margin-top: 10px; }
+	.panels figure { margin: 0; font-size: 12px; color: var(--mute); }
+	.facts { width: 100%; font-size: 13px; }
+	.facts td:first-child { color: var(--mute); width: 38%; }
+	details { margin-top: 10px; font-size: 13px; }
+	#log { margin-top: 20px; }
+	details pre { white-space: pre-wrap; word-break: break-word; font: 12px/1.4 ui-monospace, monospace; margin: 6px 0 0; }
+	.err { color: var(--bad); font-size: 13px; }
+	.banner { background: var(--bad); color: #fff; padding: 8px 12px; border-radius: 8px; margin-bottom: 16px; }
+	[hidden] { display: none; }
+</style>
+<h1><span class="dot" id="dot"></span><span id="model">Image server</span></h1>
+<div class="sub" id="sub">Connecting…</div>
+<div class="banner" id="offline" hidden>Can't reach the service. Showing the last data received.</div>
+<div class="cards">
+	<div class="card"><b id="c-state">–</b><span>now</span></div>
+	<div class="card"><b id="c-queued">–</b><span>waiting</span></div>
+	<div class="card"><b id="c-drafts">–</b><span>drafts to collect</span></div>
+	<div class="card"><b id="c-failed">–</b><span>failed</span></div>
+	<div class="card"><b id="c-up">–</b><span>up for</span></div>
+</div>
+<div class="cards" id="health">
+	<div class="card"><b id="m-rate">–</b><span>jobs succeeded</span></div>
+	<div class="card"><b id="m-photo">–</b><span>per photo (median)</span></div>
+	<div class="card"><b id="m-slow">–</b><span>per photo (slowest 5%)</span></div>
+	<div class="card"><b id="m-wait">–</b><span>queue wait (median)</span></div>
+	<div class="card"><b id="m-mem">–</b><span>memory retries</span></div>
+	<div class="card"><b id="m-free">–</b><span>memory free · disk</span></div>
+</div>
+<div class="err" id="lastfail"></div>
+<table>
+	<thead><tr><th></th><th>Job</th><th>Status</th><th>Progress</th><th>Sent</th><th>Waited</th><th>Drew</th></tr></thead>
+	<tbody id="rows"><tr><td colspan="7" class="sub">No jobs.</td></tr></tbody>
+</table>
+<details id="log"><summary>Recent events</summary><pre id="events">No events yet.</pre></details>
+<dialog id="dlg">
+	<div class="dhead"><b id="dtitle"></b><button type="button" id="dclose">Close</button></div>
+	<div class="dgrid">
+		<div><a id="dfull" target="_blank"><img id="dimg" alt=""></a><div class="panels" id="dpanels"></div></div>
+		<div>
+			<table class="facts"><tbody id="dfacts"></tbody></table>
+			<div class="err" id="derr"></div>
+			<details><summary>Prompt</summary><pre id="dprompt"></pre></details>
+			<details><summary>Drawn from (each photo)</summary><pre id="dpp"></pre></details>
+			<details open><summary>Timeline</summary><pre id="dtimeline"></pre></details>
+		</div>
+	</div>
+</dialog>
+<script>
+	var $ = function (id) { return document.getElementById(id); };
+	function ago(s) {
+		s = Math.max(0, Math.round(s));
+		if (s < 90) return s + "s";
+		if (s < 5400) return Math.round(s / 60) + " min";
+		if (s < 129600) return (s / 3600).toFixed(1) + " h";
+		return Math.round(s / 86400) + " d";
+	}
+	function text(el, value) { el.textContent = value; }
+	function render(h, jobs) {
+		var now = Date.now() / 1000;
+		text($("model"), h.model);
+		$("dot").style.background = !h.ready ? "var(--bad)" : h.busy ? "var(--busy)" : "var(--ok)";
+		text($("sub"), (h.ready ? "Ready" : "Missing files: " + (h.missing_files || []).join(", ")) +
+			" · updated " + new Date().toLocaleTimeString());
+		text($("c-state"), !h.ready ? "Not ready" : h.busy ? (h.progress || "Drawing") : "Idle");
+		text($("c-queued"), h.queue_length);
+		text($("c-drafts"), h.drafts_waiting);
+		var failed = jobs.filter(function (j) { return j.status === "failed"; }).length;
+		text($("c-failed"), failed);
+		text($("c-up"), h.uptime_seconds == null ? "–" : ago(h.uptime_seconds));
+		var tbody = $("rows");
+		jobs.sort(function (a, b) { return b.created - a.created; });
+		var signature = JSON.stringify(jobs.map(function (j) { return [j.job_id, j.status, j.progress, j.error]; }));
+		if (signature === render.last) { stamp(jobs, now); return; }
+		render.last = signature;
+		tbody.textContent = "";
+		if (!jobs.length) {
+			var tr = tbody.insertRow(), td = tr.insertCell();
+			td.colSpan = 7; td.className = "sub"; td.textContent = "No jobs.";
+		}
+		jobs.slice(0, 50).forEach(function (j) {
+			var tr = tbody.insertRow();
+			tr.className = "job";
+			tr.onclick = function () { openJob(j.job_id); };
+			var pic = tr.insertCell();
+			if (j.status === "done") {
+				var a = document.createElement("a");
+				a.href = "/jobs/" + j.job_id + "/image"; a.target = "_blank";
+				var img = document.createElement("img");
+				img.className = "thumb"; img.loading = "lazy"; img.alt = "";
+				img.src = "/jobs/" + j.job_id + "/thumb";
+				a.appendChild(img); pic.appendChild(a);
+			}
+			tr.insertCell().textContent = j.job_id.slice(0, 10);
+			var badge = document.createElement("span");
+			badge.className = "badge " + j.status; badge.textContent = j.status;
+			tr.insertCell().appendChild(badge);
+			var progress = tr.insertCell();
+			progress.textContent = j.progress || "";
+			if (j.error) {
+				var e = document.createElement("div");
+				e.className = "err"; e.textContent = j.error; progress.appendChild(e);
+			}
+			tr.insertCell().className = "sent";
+			tr.insertCell().className = "waited";
+			tr.insertCell().className = "drew";
+		});
+		stamp(jobs, now);
+	}
+	function stamp(jobs, now) {
+		var sent = document.querySelectorAll("#rows td.sent"), waited = document.querySelectorAll("#rows td.waited"),
+			drew = document.querySelectorAll("#rows td.drew");
+		jobs.slice(0, 50).forEach(function (j, i) {
+			if (!sent[i]) return;
+			sent[i].textContent = ago(now - j.created) + " ago";
+			waited[i].textContent = j.started ? ago(j.started - j.created) : (j.status === "queued" ? ago(now - j.created) : "");
+			drew[i].textContent = j.run_seconds != null ? ago(j.run_seconds) : "";
+		});
+	}
+	var openId = null;
+	function when(t) { return t ? new Date(t * 1000).toLocaleString() : "–"; }
+	function fact(label, value) {
+		var tr = $("dfacts").insertRow();
+		tr.insertCell().textContent = label;
+		tr.insertCell().textContent = value;
+	}
+	function openJob(id) {
+		openId = id;
+		if (!$("dlg").open) $("dlg").showModal();
+		showJob();
+	}
+	function showJob() {
+		if (!openId) return;
+		var id = openId;
+		fetch("/jobs/" + id + "/detail").then(function (r) { return r.json(); }).then(function (d) {
+			if (id !== openId) return;
+			text($("dtitle"), d.job_id.slice(0, 10) + " · " + d.status);
+			var img = $("dimg");
+			if (d.has_result && d.status === "done") {
+				var src = "/jobs/" + id + "/image";
+				if (img.getAttribute("src") !== src) img.src = src;
+				$("dfull").href = src; img.hidden = false;
+			} else { img.hidden = true; img.removeAttribute("src"); }
+			var holder = $("dpanels");
+			holder.textContent = "";
+			if ((d.panel_files || []).length > 1) {
+				d.panel_files.forEach(function (n) {
+					var fig = document.createElement("figure"), a = document.createElement("a"), im = document.createElement("img");
+					a.href = im.src = "/jobs/" + id + "/panel/" + n; a.target = "_blank"; im.loading = "lazy"; im.alt = "";
+					a.appendChild(im); fig.appendChild(a);
+					var cap = document.createElement("figcaption");
+					cap.textContent = "Photo " + n + (d.panel_seconds[n] != null ? " · " + d.panel_seconds[n] + " s" : "");
+					fig.appendChild(cap); holder.appendChild(fig);
+				});
+			}
+			$("dfacts").textContent = "";
+			fact("Size", d.width + " × " + d.height + (d.panels > 1 ? " · " + d.panels + " photos" : ""));
+			fact("Seed", d.seed == null ? "–" : d.seed);
+			fact("Steps", d.steps);
+			fact("Sent", when(d.created));
+			fact("Started drawing", when(d.started));
+			fact("Finished", when(d.finished));
+			fact("Waited in queue", d.started ? ago(d.started - d.created) : "–");
+			fact("Drawing time", d.run_seconds != null ? d.run_seconds + " s" : "–");
+			text($("derr"), d.error || "");
+			text($("dprompt"), d.prompt);
+			text($("dpp"), Object.keys(d.panel_prompts || {}).map(function (n) {
+				return "Photo " + n + ":\n" + d.panel_prompts[n];
+			}).join("\n\n") || "Not recorded for this job.");
+			text($("dtimeline"), (d.events || []).map(eventLine).join("\n") || "No events recorded.");
+		}, function () {});
+	}
+	$("dclose").onclick = function () { openId = null; $("dlg").close(); };
+	$("dlg").addEventListener("close", function () { openId = null; });
+	$("dlg").addEventListener("click", function (e) { if (e.target === $("dlg")) $("dlg").close(); });
+	function fmt(v, unit) { return v == null ? "–" : v + (unit || ""); }
+	function bytes(n) { return n < 1e6 ? Math.round(n / 1e3) + " KB" : n < 1e9 ? (n / 1e6).toFixed(0) + " MB" : (n / 1e9).toFixed(1) + " GB"; }
+	function eventLine(e) {
+		var rest = Object.keys(e).filter(function (k) { return k !== "t" && k !== "kind" && k !== "job"; })
+			.map(function (k) { return k + "=" + e[k]; }).join(" ");
+		return new Date(e.t * 1000).toLocaleTimeString() + "  " + e.kind + (e.job ? "  " + e.job.slice(0, 8) : "") + (rest ? "  " + rest : "");
+	}
+	function renderMetrics(m, events) {
+		var j = m.jobs;
+		text($("m-rate"), j.success_rate == null ? "–" : Math.round(j.success_rate * 100) + "%");
+		$("m-rate").title = j.finished + " done, " + j.failed + " failed, " + j.cancelled + " cancelled (last " + m.window.events + " events)";
+		text($("m-photo"), fmt(m.photo_seconds.p50, " s"));
+		text($("m-slow"), fmt(m.photo_seconds.p95, " s"));
+		text($("m-wait"), m.queue_wait_seconds.count ? ago(m.queue_wait_seconds.p50) : "–");
+		text($("m-mem"), m.memory.retries);
+		$("m-mem").title = m.memory.waits + " waits for memory, " + m.memory.wait_seconds + " s in total";
+		text($("m-free"), fmt(m.memory_free_percent, "%") + " · " + bytes(m.disk.jobs_bytes));
+		var f = m.last_failure, note = f ? "Last failure " + ago(Date.now() / 1000 - f.t) + " ago: " + f.error : "";
+		if (m.now.worker_alive === false) note = "The drawing worker has stopped. Restart the service.";
+		else if (m.now.running_seconds > 1800) note = "One drawing has run for " + ago(m.now.running_seconds) + ".";
+		text($("lastfail"), note);
+		if (events) text($("events"), events.map(eventLine).join("\n") || "No events yet.");
+	}
+	var ticks = 0;
+	function tick() {
+		if (openId) showJob();
+		if (ticks++ % 5 === 0) {
+			Promise.all([fetch("/metrics").then(function (r) { return r.json(); }),
+				$("log").open ? fetch("/events?limit=40").then(function (r) { return r.json(); }) : null]).then(function (res) {
+				renderMetrics(res[0], res[1] && res[1].events);
+			}, function () {});
+		}
+		Promise.all([fetch("/health").then(function (r) { return r.json(); }),
+			fetch("/jobs").then(function (r) { return r.json(); })]).then(function (res) {
+			$("offline").hidden = true;
+			render(res[0], res[1].jobs || []);
+		}, function () { $("offline").hidden = false; });
+	}
+	$("log").addEventListener("toggle", function () { ticks = 0; });
+	tick();
+	setInterval(tick, 3000);
+</script>

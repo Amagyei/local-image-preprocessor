@@ -396,7 +396,7 @@ class Service(unittest.TestCase):
 		_, data = self.submit_job()
 		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
 		folder = os.path.join(self.service.jobs_root, data["job_id"])
-		self.assertEqual(sorted(os.listdir(folder)), ["meta.json", "result.png"])  # photo dropped once drawn
+		self.assertEqual(sorted(os.listdir(folder)), ["meta.json", "panel-1.png", "result.png"])  # photo dropped once drawn
 		self.assertEqual(self.request("GET", f"/jobs/{data['job_id']}/result")[0], 200)
 		self.assertEqual(self.request("GET", f"/jobs/{data['job_id']}/result")[0], 200)
 		self.assertEqual(self.request("DELETE", f"/jobs/{data['job_id']}")[0], 200)
@@ -492,11 +492,160 @@ class Service(unittest.TestCase):
 			self.assertTrue(self.wait_until(lambda: after.durable_state(job.key)["status"] == "done"))
 		self.assertEqual(self.call_count(), 3)
 
+	def test_status_page_is_served_and_reads_only_public_data(self):
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+		connection.request("GET", "/ui")
+		response = connection.getresponse()
+		page = response.read().decode()
+		connection.close()
+		self.assertEqual(response.status, 200)
+		self.assertIn("text/html", response.getheader("Content-Type"))
+		self.assertIn('fetch("/health")', page)
+		self.assertNotIn("/result", page)  # it never uses the collection endpoint
+		self.assertGreaterEqual(self.health()["uptime_seconds"], 0)
+
+	def test_status_page_does_not_hold_up_a_run(self):
+		os.environ["FAKE_SLEEP"] = "0.3"
+		_, data = self.submit_job()
+		for _ in range(20):
+			self.request("GET", "/jobs")
+			self.health()
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+
+	def test_status_page_can_show_a_finished_picture_but_not_an_unfinished_one(self):
+		os.environ["FAKE_SLEEP"] = "0.3"
+		_, data = self.submit_job()
+		job = data["job_id"]
+		self.assertEqual(self.raw("GET", f"/jobs/{job}/thumb")[0], 404)  # still drawing
+		self.assertTrue(self.wait_for_status(job, "done"))
+		status, kind, thumb = self.raw("GET", f"/jobs/{job}/thumb")
+		self.assertEqual((status, kind), (200, "image/jpeg"))
+		self.assertLessEqual(max(Image.open(io.BytesIO(thumb)).size), 320)
+		status, kind, full = self.raw("GET", f"/jobs/{job}/image")
+		self.assertEqual((status, kind), (200, "image/png"))
+		self.assertEqual(Image.open(io.BytesIO(full)).size, (768, 1024))
+		self.assertEqual(self.raw("GET", "/jobs/nope/image")[0], 404)
+
+	def raw(self, method, path):
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+		connection.request(method, path)
+		response = connection.getresponse()
+		body = response.read()
+		connection.close()
+		return response.status, response.getheader("Content-Type"), body
+
+	def test_a_job_can_be_opened_to_see_every_photo_drawn_for_it(self):
+		_, data = self.submit_job(STORY, width=1536, height=2048)
+		job = data["job_id"]
+		self.assertTrue(self.wait_for_status(job, "done"))
+		status, detail = self.request("GET", f"/jobs/{job}/detail")
+		self.assertEqual(status, 200)
+		self.assertEqual(detail["panel_files"], [1, 2, 3, 4])
+		self.assertEqual(detail["panels"], 4)
+		self.assertEqual(sorted(detail["panel_seconds"]), ["1", "2", "3", "4"])
+		self.assertEqual(detail["run_seconds"], round(sum(detail["panel_seconds"].values()), 1))
+		self.assertEqual((detail["width"], detail["height"]), (1536, 2048))
+		self.assertTrue(detail["prompt"].startswith("A 2x2 grid"))
+		self.assertTrue(detail["started"] and detail["finished"] >= detail["started"])
+		status, kind, body = self.raw("GET", f"/jobs/{job}/panel/3")
+		self.assertEqual((status, kind), (200, "image/png"))
+		self.assertEqual(Image.open(io.BytesIO(body)).size, (768, 1024))
+		self.assertEqual(self.raw("GET", f"/jobs/{job}/panel/9")[0], 404)
+		self.assertEqual(self.request("GET", "/jobs/nope/detail")[0], 404)
+
+	def test_timings_survive_a_restart(self):
+		_, data = self.submit_job()
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+		again = server.Service(dict(self.config, temp_dir=self.config["temp_dir"] + "-b"))
+		state = again.durable_state(data["job_id"])
+		self.assertEqual(state["status"], "done")
+		self.assertIsNotNone(state["run_seconds"])
+		self.assertEqual(state["panels"], 1)
+
 	def test_health_names_missing_files(self):
 		self.config["weights"]["--vae"] = "/nonexistent/vae.safetensors"
 		state = self.health()
 		self.assertFalse(state["ready"])
 		self.assertEqual(state["missing_files"], ["vae.safetensors"])
+
+
+	def test_metrics_and_timeline_describe_a_finished_grid(self):
+		_, data = self.submit_job(STORY, width=1536, height=2048)
+		job = data["job_id"]
+		self.assertTrue(self.wait_for_status(job, "done"))
+		_, metrics = self.request("GET", "/metrics")
+		self.assertEqual(metrics["jobs"]["finished"], 1)
+		self.assertEqual(metrics["jobs"]["success_rate"], 1.0)
+		self.assertEqual(metrics["photo_seconds"]["count"], 4)
+		self.assertTrue(metrics["now"]["worker_alive"])
+		self.assertGreater(metrics["disk"]["jobs_bytes"], 0)
+		self.assertEqual(metrics["restarts"], 1)
+
+		_, detail = self.request("GET", f"/jobs/{job}/detail")
+		kinds = [e["kind"] for e in detail["events"]]
+		self.assertEqual(kinds, ["queued", "started"] + ["panel_done"] * 4 + ["finished"])
+		self.assertEqual(sorted(detail["panel_prompts"]), ["1", "2", "3", "4"])
+		self.assertIn("Seated, hands clasped", detail["panel_prompts"]["1"])
+		self.assertNotIn("Seated, hands clasped", json.dumps(metrics))
+
+	def test_failures_and_memory_retries_are_counted(self):
+		self.config["memory_retries"] = 1
+		open(self.fail_flag + "-once", "w").close()
+		_, data = self.submit_job()
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+		open(self.fail_flag, "w").close()
+		_, data = self.submit_job("Another photo.")
+		self.assertTrue(self.wait_for_status(data["job_id"], "failed"))
+		_, metrics = self.request("GET", "/metrics")
+		self.assertEqual(metrics["memory"]["retries"], 2)
+		self.assertEqual(metrics["jobs"]["failed"], 1)
+		self.assertEqual(metrics["jobs"]["success_rate"], 0.5)
+		self.assertIn("ran out of memory", metrics["last_failure"]["error"])
+		self.assertEqual(metrics["failure_reasons"][0]["count"], 1)
+		_, events = self.request("GET", f"/events?limit=3&job={data['job_id']}")
+		self.assertEqual(events["events"][0]["kind"], "failed")
+
+	def test_jobs_can_be_filtered_to_the_running_one(self):
+		os.environ["FAKE_SLEEP"] = "0.5"
+		_, first = self.submit_job("One.")
+		_, second = self.submit_job("Two.")
+		self.assertTrue(self.wait_until(lambda: self.request("GET", "/jobs?status=running")[1]["jobs"]))
+		_, running = self.request("GET", "/jobs?status=running")
+		self.assertEqual([j["job_id"] for j in running["jobs"]], [first["job_id"]])
+		_, queued = self.request("GET", "/jobs?status=queued")
+		self.assertEqual([j["job_id"] for j in queued["jobs"]], [second["job_id"]])
+
+	def test_history_survives_a_restart_and_never_holds_prompts(self):
+		_, data = self.submit_job("A secret prompt about a dress.")
+		self.assertTrue(self.wait_for_status(data["job_id"], "done"))
+		again = server.Service(dict(self.config, temp_dir=self.config["temp_dir"] + "-b"))
+		self.assertEqual(again.observer.stats()["jobs"]["finished"], 1)
+		self.assertEqual(again.observer.stats()["restarts"], 2)
+		with open(again.observer.path) as f:
+			self.assertNotIn("secret prompt", f.read())
+
+	def test_a_broken_event_file_never_stops_recording(self):
+		from observe import Observer
+		blocked = os.path.join(self.folder.name, "file")
+		open(blocked, "w").close()
+		observer = Observer(os.path.join(blocked, "events.jsonl"))  # a folder can't be made inside a file
+		observer.record("failed", "job", error="x")
+		self.assertEqual(observer.stats()["jobs"]["failed"], 1)
+
+	def test_event_file_is_trimmed(self):
+		from observe import Observer
+		path = os.path.join(self.folder.name, "ev", "events.jsonl")
+		observer = Observer(path, keep=10)
+		for n in range(25):
+			observer.record("queued", f"job{n}")
+		with open(path) as f:
+			self.assertLess(len(f.readlines()), 25)  # trimmed every 10 lines, so it never reaches 2 x keep
+		self.assertEqual(Observer(path, keep=10).recent(1)[0]["job"], "job24")
+
+	def test_timing_spread(self):
+		from observe import _spread
+		self.assertEqual(_spread([]), {"count": 0, "p50": None, "p95": None, "max": None})
+		self.assertEqual(_spread(list(range(1, 101))), {"count": 100, "p50": 50, "p95": 95, "max": 100})
 
 
 if __name__ == "__main__":

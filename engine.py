@@ -42,8 +42,11 @@ class SdCli:
 		paths = [self.config["sd_cli"], *self.config["weights"].values()]
 		return [path for path in paths if not os.path.exists(path)]
 
-	def generate(self, *, prompt, reference, width, height, seed, output, is_cancelled=lambda: False):
-		"""Write a PNG to `output` and return the seconds it took. Raises GenerationError."""
+	def generate(self, *, prompt, reference, width, height, seed, output, is_cancelled=lambda: False, on_event=None):
+		"""Write a PNG to `output` and return the seconds it took. Raises GenerationError.
+
+		`on_event(kind, **fields)` hears about memory waits and out-of-memory retries."""
+		note = on_event or (lambda kind, **fields: None)
 		c = self.config
 		command = [
 			c["sd_cli"],
@@ -62,7 +65,9 @@ class SdCli:
 		started = time.monotonic()
 		retries = c["memory_retries"]
 		for attempt in range(retries + 1):
-			self._wait_for_memory(is_cancelled)
+			waited = self._wait_for_memory(is_cancelled)
+			if waited >= 1:
+				note("memory_wait", seconds=round(waited, 1), attempt=attempt + 1)
 			if is_cancelled():
 				raise GenerationError("Cancelled.")
 			try:
@@ -73,6 +78,7 @@ class SdCli:
 				if attempt == retries or self._stopping:
 					raise
 				log.warning("ran out of memory, trying this photo again (%s of %s)", attempt + 1, retries)
+				note("oom_retry", attempt=attempt + 1, of=retries)
 		return time.monotonic() - started
 
 	def stop(self):
@@ -89,12 +95,15 @@ class SdCli:
 				self._process.kill()
 
 	def _wait_for_memory(self, is_cancelled):
-		"""The last run's memory takes a while to come back, and starting early is what fails."""
-		deadline = time.monotonic() + self.config["memory_settle_seconds"]
+		"""The last run's memory takes a while to come back, and starting early is what fails.
+		Returns the seconds spent waiting."""
+		began = time.monotonic()
+		deadline = began + self.config["memory_settle_seconds"]
 		while time.monotonic() < deadline and not self._stopping and not is_cancelled():
 			if (_free_percent() or 100) >= self.config["memory_settle_free_percent"]:
-				return
+				break
 			time.sleep(5)
+		return time.monotonic() - began
 
 	def _run(self, command, output):
 		timeout = self.config["generation_timeout_seconds"]

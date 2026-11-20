@@ -16,6 +16,21 @@ A successful call returns 200 with `{"images": ["<base64 PNG>"]}`. Bad requests 
 
 `GET /health` returns `model`, `ready`, `missing_files`, `loaded`, `busy`, `queue_length`, `progress` and `results_kept`. `loaded` and `busy` always match, because the model is only in memory during a run.
 
+### Looking at what it is doing
+
+| Call | Shows |
+|---|---|
+| `GET /jobs?status=running` | The job being drawn now. `queued`, `done` and `failed` work too; no filter lists everything. |
+| `GET /metrics` | The health strip as JSON: jobs finished and failed, success rate, seconds per photo (median, 95th percentile, slowest), queue wait, memory retries and waits, last failure and the usual failure causes, free memory, disk used by `runtime/jobs`, and `now` (the same as `/health`). |
+| `GET /events?limit=100&job=<id>` | The latest events, newest first, optionally for one job. |
+| `GET /jobs/{id}/detail` | Also has `events` (that job's timeline) and `panel_prompts` (the exact text each photo was drawn from, with `garment_instruction` added). |
+
+Every event (queued, started, photo drawn, memory wait, memory retry, finished, failed, cancelled, resumed, removed, expired, startup) is one line in `runtime/events.jsonl` (`events_file` in `config.json`), the last 2000 kept, so the figures survive a restart. Events hold ids, sizes, timings and error text, never photos or prompts. `/health` also has `worker_alive` and `running_seconds`.
+
+### Status page
+
+`GET /ui` (also `/`) is a read-only page showing whether the service is ready, what is drawing, what is waiting, drafts to collect, failures and uptime, refreshed every 3 seconds. It reads `/health` and `/jobs`, and shows a thumbnail of each finished picture (`/jobs/{id}/thumb`, full size at `/jobs/{id}/image`). It never shows the garment photo and never touches the queue. A health strip (from `/metrics`) and a list of recent events sit above and below the table, and opening a job shows its prompt, the text each photo was drawn from, and its timeline. Through the tunnel: `http://localhost:7860/ui`.
+
 ### Drafts: jobs that outlive the connection
 
 The laptop doesn't have to stay connected while a drawing runs.
@@ -82,3 +97,15 @@ Tests use a stand-in for sd-cli, so they need no weights:
 ## Prompts
 
 `garment_instruction` in `config.json` adds the same line to every prompt, so it stays empty: not every garment is full length. Klein tends to shorten long garments, so Studio's form has a Garment length field that adds it to the prompt.
+
+## Reaching it from the shop server
+
+This Mac only draws images. It dials out to the shop server, so the server can use it as `http://127.0.0.1:7860` without any port being opened to the internet. The service itself still listens on `127.0.0.1` only.
+
+```bash
+TUNNEL_REMOTE=user@server ./install_tunnel_agent.sh          # makes ~/.ssh/image-host-tunnel and the launch agent; prints one authorized_keys line
+./install_tunnel_agent.sh --start                            # after the server has that line
+./install_tunnel_agent.sh --check                            # is it up
+```
+
+Put the server's host keys in `~/.ssh/image-host-known_hosts` first (`TUNNEL_KNOWN_HOSTS` points elsewhere); the tunnel refuses a server it doesn't recognise. The key is limited on the server to opening this one port, with no shell. Set "Local Image Tool URL" in Studio settings to `http://127.0.0.1:7860`.
