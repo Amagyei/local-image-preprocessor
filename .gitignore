@@ -4,3 +4,5 @@ __pycache__/
 *.log
 amagyei-github
 amagyei-github.pub
+experiments/*/inputs/
+experiments/*/outputs/
