@@ -14,7 +14,19 @@ The service listens on 127.0.0.1 only. The laptop reaches it through an SSH tunn
 
 A successful call returns 200 with `{"images": ["<base64 PNG>"]}`. Bad requests get 400, and failed runs get 500. Both come with `{"error": "..."}`.
 
-`GET /health` returns `model`, `ready`, `missing_files`, `loaded`, `busy`, `queue_length`, `progress` and `results_kept`. `loaded` and `busy` always match, because the model is only in memory during a run.
+### Canvas mode: keep the garment, draw around it
+
+Any request (`/sdapi/v1/img2img`, `/jobs`, or a job in `/batches`) can add:
+
+| Field | Meaning |
+|---|---|
+| `mask` | Base64 PNG, the same size as the photo. White = the model draws here; black = the photo stays. Turns canvas mode on. |
+| `strength` | Above 0, at most 1 (default 1.0). Only with a mask. |
+| `keep_masked_pixels` | Default true: after drawing, the photo's own pixels are pasted back wherever the mask is black, with a 2 px soft edge, so the kept garment can't drift. |
+
+sd-cli then gets `-i <photo> --mask <mask> --strength <s>` as well as the usual `-r <photo>`. Grid prompts still split into panels; each panel starts from the same photo and mask, scaled to the panel. A job's key only changes when a mask is sent, so plain requests keep the keys they had. The mask is kept on disk with the photo (`mask.bin`) until the drawing finishes. `/health` lists `"canvas"` in `features`.
+
+`GET /health` returns `model`, `ready`, `missing_files`, `loaded`, `busy`, `queue_length`, `progress`, `results_kept` and `features`. `loaded` and `busy` always match, because the model is only in memory during a run.
 
 ### Looking at what it is doing
 

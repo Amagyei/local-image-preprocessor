@@ -42,10 +42,13 @@ class SdCli:
 		paths = [self.config["sd_cli"], *self.config["weights"].values()]
 		return [path for path in paths if not os.path.exists(path)]
 
-	def generate(self, *, prompt, reference, width, height, seed, output, is_cancelled=lambda: False, on_event=None):
+	def generate(self, *, prompt, reference, width, height, seed, output, is_cancelled=lambda: False, on_event=None,
+			init=None, mask=None, strength=None):
 		"""Write a PNG to `output` and return the seconds it took. Raises GenerationError.
 
-		`on_event(kind, **fields)` hears about memory waits and out-of-memory retries."""
+		With `init` and `mask` (canvas mode) the model starts from `init` and only redraws where
+		`mask` is white; black is kept. `on_event(kind, **fields)` hears about memory waits and
+		out-of-memory retries."""
 		note = on_event or (lambda kind, **fields: None)
 		c = self.config
 		command = [
@@ -62,6 +65,8 @@ class SdCli:
 			"-o", output,
 			*c["extra_args"],
 		]
+		if init and mask:
+			command += ["-i", init, "--mask", mask, "--strength", str(strength if strength is not None else 1.0)]
 		started = time.monotonic()
 		retries = c["memory_retries"]
 		for attempt in range(retries + 1):

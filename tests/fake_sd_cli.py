@@ -1,5 +1,6 @@
 """Stands in for sd-cli in the tests: draws a flat colour, or fails on request."""
 
+import json
 import os
 import sys
 import time
@@ -32,7 +33,17 @@ def main():
 		print("[E] generate failed --- fake.cpp:3", file=sys.stderr)
 		sys.exit(1)
 
-	Image.new("RGB", (int(value("-W")), int(value("-H"))), (200, 40, 40)).save(value("-o"))
+	if os.environ.get("FAKE_ARGS"):
+		with open(os.environ["FAKE_ARGS"], "a") as f:
+			f.write(json.dumps(args) + "\n")
+
+	size = (int(value("-W")), int(value("-H")))
+	drawn = Image.new("RGB", size, (200, 40, 40))
+	if "-i" in args and "--mask" in args:
+		# Canvas mode: a careless model that also smudges what it should keep.
+		init = Image.open(value("-i")).convert("RGB").resize(size)
+		drawn = Image.blend(init, drawn, 0.5)
+	drawn.save(value("-o"))
 
 
 main()

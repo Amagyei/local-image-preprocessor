@@ -813,3 +813,145 @@ class Service(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+def solid(size, colour, fmt="PNG"):
+	buffer = io.BytesIO()
+	Image.new("RGB" if isinstance(colour, tuple) else "L", size, colour).save(buffer, fmt)
+	return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def half_mask(size):
+	"""Left half black (keep), right half white (draw)."""
+	m = Image.new("L", size, 0)
+	m.paste(255, (size[0] // 2, 0, size[0], size[1]))
+	buffer = io.BytesIO()
+	m.save(buffer, "PNG")
+	return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+class Canvas(unittest.TestCase):
+	"""Canvas mode: start from the photo, redraw only where the mask is white."""
+
+	post, health, wait_until = Service.post, Service.health, Service.wait_until
+
+	def setUp(self):
+		Service.setUp(self)
+		self.args = os.path.join(self.folder.name, "args.jsonl")
+		os.environ["FAKE_ARGS"] = self.args
+		self.addCleanup(os.environ.pop, "FAKE_ARGS", None)
+		self.photo = solid((768, 1024), (10, 120, 60))
+
+	def last_args(self):
+		with open(self.args) as f:
+			return json.loads(f.readlines()[-1])
+
+	def canvas(self, prompt="A photo.", **extra):
+		return self.post(prompt, init_images=[self.photo], mask=half_mask((768, 1024)), **extra)
+
+	def test_passes_init_mask_and_strength_to_the_model(self):
+		status, _ = self.canvas(strength=0.9)
+		self.assertEqual(status, 200)
+		args = self.last_args()
+		self.assertIn("-i", args)
+		self.assertIn("--mask", args)
+		self.assertEqual(args[args.index("--strength") + 1], "0.9")
+		self.assertIn("-r", args)  # the photo is still the reference
+
+	def test_default_strength_is_full(self):
+		self.canvas()
+		args = self.last_args()
+		self.assertEqual(args[args.index("--strength") + 1], "1.0")
+
+	def test_kept_area_is_the_photo_exactly(self):
+		status, data = self.canvas()
+		image = Image.open(io.BytesIO(base64.b64decode(data["images"][0]))).convert("RGB")
+		self.assertEqual(image.getpixel((100, 500)), (10, 120, 60))  # well inside the black half
+		self.assertNotEqual(image.getpixel((700, 500)), (10, 120, 60))  # drawn half
+
+	def test_keep_can_be_switched_off(self):
+		status, data = self.canvas(keep_masked_pixels=False)
+		image = Image.open(io.BytesIO(base64.b64decode(data["images"][0]))).convert("RGB")
+		self.assertNotEqual(image.getpixel((100, 500)), (10, 120, 60))
+
+	def test_grid_panels_each_start_from_the_canvas(self):
+		status, data = self.post(LOOKBOOK, width=1536, height=2048, init_images=[self.photo], mask=half_mask((768, 1024)))
+		self.assertEqual(status, 200)
+		with open(self.args) as f:
+			calls = [json.loads(line) for line in f]
+		self.assertEqual(len(calls), 4)
+		self.assertTrue(all("-i" in c and "--mask" in c for c in calls))
+		image = Image.open(io.BytesIO(base64.b64decode(data["images"][0]))).convert("RGB")
+		self.assertEqual(image.getpixel((60, 500)), (10, 120, 60))  # kept part of the top-left panel
+
+	def test_plain_requests_are_unchanged(self):
+		self.post()
+		self.assertNotIn("--mask", self.last_args())
+
+	def test_mask_changes_the_job_but_not_plain_keys(self):
+		plain = server.job_from({"prompt": "A.", "init_images": [self.photo], "width": 768, "height": 1024})
+		canvas = server.job_from({"prompt": "A.", "init_images": [self.photo], "width": 768, "height": 1024, "mask": half_mask((768, 1024))})
+		import hashlib
+		photo = base64.b64decode(self.photo)
+		old_key = hashlib.sha256(json.dumps(["A.", 768, 1024]).encode() + hashlib.sha256(photo).digest()).hexdigest()
+		self.assertEqual(plain.key, old_key)
+		self.assertNotEqual(canvas.key, plain.key)
+
+	def test_bad_masks_are_refused(self):
+		cases = {
+			"wrong size": half_mask((100, 100)),
+			"not base64": "%%%",
+			"not an image": base64.b64encode(b"nope").decode(),
+			"all black": solid((768, 1024), 0),
+		}
+		for name, mask in cases.items():
+			with self.subTest(name):
+				status, data = self.post(init_images=[self.photo], mask=mask)
+				self.assertEqual(status, 400, data)
+
+	def test_strength_needs_a_mask_and_a_sane_value(self):
+		self.assertEqual(self.post(strength=0.5)[0], 400)
+		self.assertEqual(self.canvas(strength=0)[0], 400)
+		self.assertEqual(self.canvas(strength=1.5)[0], 400)
+		self.assertEqual(self.canvas(keep_masked_pixels="yes")[0], 400)
+
+	def test_health_lists_canvas(self):
+		self.assertIn("canvas", self.health()["features"])
+
+	def canvas_job(self, prompt="A photo."):
+		return server.job_from({"prompt": prompt, "init_images": [self.photo], "width": 768, "height": 1024, "mask": half_mask((768, 1024))})
+
+	def test_unfinished_canvas_job_resumes_with_its_mask_after_restart(self):
+		config = dict(self.config, temp_dir=os.path.join(self.folder.name, "tmp2"), jobs_dir=os.path.join(self.folder.name, "jobs2"))
+		before = server.Service(config)
+		before.queue = __import__("queue").Queue()  # never started: the power went out
+		job = before.submit_durable(self.canvas_job())
+		with open(os.path.join(job.folder, "meta.json")) as f:
+			meta = json.load(f)
+		self.assertTrue(meta["canvas"])
+		self.assertTrue(os.path.exists(os.path.join(job.folder, "mask.bin")))
+
+		after = server.Service(config)
+		after.start()
+		self.assertTrue(self.wait_until(lambda: after.durable_state(job.key)["status"] == "done"))
+		self.assertIn("--mask", self.last_args())
+		self.assertFalse(os.path.exists(os.path.join(job.folder, "mask.bin")))
+		self.assertFalse(os.path.exists(os.path.join(job.folder, "photo.bin")))
+		image = Image.open(io.BytesIO(base64.b64decode(after.durable_result(job.key)))).convert("RGB")
+		self.assertEqual(image.getpixel((100, 500)), (10, 120, 60))
+
+	def test_canvas_jobs_go_in_batches(self):
+		status, data = self.post_batch({"init_images": [self.photo], "jobs": [
+			{"prompt": "A.", "width": 768, "height": 1024, "mask": half_mask((768, 1024))},
+			{"prompt": "A.", "width": 768, "height": 1024},
+		]})
+		self.assertEqual(status, 202, data)
+		self.assertEqual(data["total"], 2)  # canvas and plain are different drawings
+
+	def post_batch(self, body):
+		connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+		connection.request("POST", "/batches", json.dumps(body), {"Content-Type": "application/json"})
+		response = connection.getresponse()
+		data = json.loads(response.read())
+		connection.close()
+		return response.status, data

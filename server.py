@@ -24,7 +24,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageFilter, ImageOps, UnidentifiedImageError
 
 import panels as panels_module
 from engine import GenerationError, SdCli, _free_percent
@@ -45,8 +45,11 @@ class BadRequest(Exception):
 
 
 class Job:
-	def __init__(self, key, prompt, width, height, photo, seed=None):
+	def __init__(self, key, prompt, width, height, photo, seed=None, mask=None, strength=None, keep_masked=True):
 		self.key = key
+		self.mask = mask  # canvas mode: white = draw here, black = keep the photo's pixels
+		self.strength = strength
+		self.keep_masked = keep_masked  # paste the photo's own pixels back where the mask is black
 		self.seed = seed  # asked for by the caller, e.g. to redo a draw differently
 		self.durable = False  # kept on disk until the caller collects it
 		self.cancelled = False  # the caller doesn't want it any more
@@ -111,9 +114,49 @@ def job_from(data):
 	if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool) or not 0 <= seed < 2**31):
 		raise BadRequest("The seed must be a whole number from 0 to 2147483647.")
 
+	mask, strength, keep_masked = _canvas_fields(data, photo)
+
 	fingerprint = [prompt, width, height] + ([seed] if seed is not None else [])
+	if mask is not None:  # only canvas jobs carry these, so earlier keys stay the same
+		fingerprint.append({"mask": hashlib.sha256(mask).hexdigest(), "strength": strength, "keep": keep_masked})
 	key = hashlib.sha256(json.dumps(fingerprint).encode() + hashlib.sha256(photo).digest()).hexdigest()
-	return Job(key, prompt, width, height, photo, seed)
+	return Job(key, prompt, width, height, photo, seed, mask, strength, keep_masked)
+
+
+def _canvas_fields(data, photo):
+	"""Optional canvas mode: {"mask": base64 PNG, "strength": 0-1, "keep_masked_pixels": bool}.
+
+	The mask is the size of the photo: white where the model draws, black where the photo stays.
+	Returns (mask bytes or None, strength, keep_masked)."""
+	raw = data.get("mask")
+	if raw is None:
+		for field in ("strength", "keep_masked_pixels"):
+			if field in data:
+				raise BadRequest(f"{field} only applies with a mask.")
+		return None, None, True
+	if not isinstance(raw, str):
+		raise BadRequest("The mask must be a base64 image.")
+	try:
+		mask = base64.b64decode(raw, validate=True)
+	except (binascii.Error, ValueError):
+		raise BadRequest("The mask wasn't valid base64.")
+	try:
+		with Image.open(io.BytesIO(mask)) as m, Image.open(io.BytesIO(photo)) as p:
+			m_size, p_size = m.size, ImageOps.exif_transpose(p).size
+			extrema = m.convert("L").getextrema()
+	except (UnidentifiedImageError, OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+		raise BadRequest("The mask couldn't be opened as an image.")
+	if m_size != p_size:
+		raise BadRequest(f"The mask is {m_size[0]}x{m_size[1]} but the photo is {p_size[0]}x{p_size[1]}; they must match.")
+	if extrema[1] < 128:
+		raise BadRequest("The mask has no white area, so there is nothing to draw.")
+	strength = data.get("strength", 1.0)
+	if not isinstance(strength, (int, float)) or isinstance(strength, bool) or not 0 < strength <= 1:
+		raise BadRequest("The strength must be a number above 0 and at most 1.")
+	keep = data.get("keep_masked_pixels", True)
+	if not isinstance(keep, bool):
+		raise BadRequest("keep_masked_pixels must be true or false.")
+	return mask, float(strength), keep
 
 
 def parse_batch(body):
@@ -226,6 +269,9 @@ class Service:
 			os.makedirs(job.folder, exist_ok=True)
 			with open(os.path.join(job.folder, "photo.bin"), "wb") as f:
 				f.write(job.photo)
+			if job.mask is not None:
+				with open(os.path.join(job.folder, "mask.bin"), "wb") as f:
+					f.write(job.mask)
 			self._write_meta(job, "queued")
 			self.jobs[job.key] = job
 			self.queue.put(job)
@@ -358,6 +404,7 @@ class Service:
 			"started": job.started_wall, "panels": job.panel_total, "run_seconds": job.run_seconds,
 			"panel_seconds": {str(n): t for n, t in job.panel_seconds.items()},
 			"panel_prompts": {str(n): t for n, t in job.panel_prompts.items()},
+			"canvas": job.mask is not None, "strength": job.strength, "keep_masked": job.keep_masked,
 		})
 		if seed is not None:
 			meta["seed"] = seed
@@ -381,14 +428,22 @@ class Service:
 			try:
 				with open(os.path.join(folder, "meta.json")) as f:
 					meta = json.load(f)
-				photo = None
+				photo = mask = None
 				if os.path.exists(os.path.join(folder, "photo.bin")):
 					with open(os.path.join(folder, "photo.bin"), "rb") as f:
 						photo = f.read()
+				if os.path.exists(os.path.join(folder, "mask.bin")):
+					with open(os.path.join(folder, "mask.bin"), "rb") as f:
+						mask = f.read()
 			except (OSError, ValueError):
 				shutil.rmtree(folder, ignore_errors=True)
 				continue
-			job = Job(key, meta["prompt"], meta["width"], meta["height"], photo, meta.get("requested_seed"))
+			if meta.get("canvas") and mask is None and meta.get("state") != "done":
+				photo = None  # a canvas job without its mask can't be drawn as asked
+			job = Job(
+				key, meta["prompt"], meta["width"], meta["height"], photo, meta.get("requested_seed"),
+				mask, meta.get("strength"), meta.get("keep_masked", True),
+			)
 			job.durable, job.folder = True, folder
 			job.created, job.finished_wall = meta.get("created", time.time()), meta.get("finished")
 			job.started_wall, job.panel_total = meta.get("started"), meta.get("panels")
@@ -538,6 +593,7 @@ class Service:
 			"running_seconds": round(time.monotonic() - self.current_since) if current and self.current_since else None,
 			"results_kept": sum(1 for job in list(self.jobs.values()) if job.done.is_set()),
 			"drafts_waiting": sum(1 for job in list(self.jobs.values()) if job.durable and job.done.is_set() and job.status == 200),
+			"features": ["jobs", "batches", "canvas"],
 		}
 
 	def metrics(self):
@@ -583,8 +639,9 @@ class Service:
 					self._write_meta(job, "done")
 					# The garment photo isn't needed now. The drawn photos stay, so a grid can be
 					# looked at one photo at a time until it's collected.
-					if os.path.exists(os.path.join(job.folder, "photo.bin")):
-						os.remove(os.path.join(job.folder, "photo.bin"))
+					for name in ("photo.bin", "mask.bin"):
+						if os.path.exists(os.path.join(job.folder, name)):
+							os.remove(os.path.join(job.folder, name))
 				else:
 					job.image = image
 				job.status = 200
@@ -598,7 +655,7 @@ class Service:
 				self._fail(job, 500, f"Unexpected error: {e.__class__.__name__}")
 			finally:
 				if not job.durable:
-					job.photo = None
+					job.photo = job.mask = None
 				job.finished_at = time.monotonic()
 				with self.lock:
 					self.current = None
@@ -650,6 +707,7 @@ class Service:
 		try:
 			reference = os.path.join(folder, "reference.png")
 			_save_reference(job.photo, reference, c["reference_long_side"])
+			canvas_source = _open_canvas(job.photo, job.mask) if job.mask is not None else None
 
 			canvas = Image.new("RGB", (job.width, job.height))
 			for panel in plan:
@@ -665,6 +723,10 @@ class Service:
 				output = os.path.join(folder, f"panel-{panel.number}.png")
 				effective = f"{panel.prompt}\n\n{c['garment_instruction']}".strip()
 				job.panel_prompts[panel.number] = effective
+				canvas_args = {}
+				if canvas_source:
+					canvas_args = _write_canvas(canvas_source, panel.draw_size, folder, panel.number)
+					canvas_args["strength"] = job.strength
 				try:
 					seconds = self.engine.generate(
 						prompt=effective,
@@ -675,6 +737,7 @@ class Service:
 						output=output,
 						is_cancelled=lambda: job.cancelled,
 						on_event=lambda kind, **fields: self.observer.record(kind, job.key, panel=panel.number, **fields),
+						**canvas_args,
 					)
 				except GenerationError as e:
 					raise GenerationError(f"Photo {panel.number} of {len(plan)}: {e}")
@@ -689,7 +752,10 @@ class Service:
 					seed, c["steps"], c["cfg_scale"], len(panel.prompt.split()), seconds,
 				)
 				with Image.open(output) as drawn:
-					fitted = ImageOps.fit(drawn.convert("RGB"), (right - left, bottom - top), Image.Resampling.LANCZOS)
+					drawn = drawn.convert("RGB")
+					if canvas_source and job.keep_masked:
+						drawn = _keep_masked(drawn, canvas_source)
+					fitted = ImageOps.fit(drawn, (right - left, bottom - top), Image.Resampling.LANCZOS)
 				canvas.paste(fitted, (left, top))
 				os.remove(output)
 				buffer = io.BytesIO()
@@ -758,6 +824,38 @@ class Service:
 		for key, kept in list(self.unfinished.items()):
 			if key != current and kept["at"] < limit:
 				del self.unfinished[key]
+
+
+def _open_canvas(photo, mask):
+	"""The photo and its mask, upright, same size. White in the mask = draw, black = keep."""
+	with Image.open(io.BytesIO(photo)) as image:
+		image = ImageOps.exif_transpose(image).convert("RGB")
+	with Image.open(io.BytesIO(mask)) as m:
+		m = m.convert("L").point(lambda v: 255 if v >= 128 else 0)
+	return image, m
+
+
+def _write_canvas(source, size, folder, number):
+	"""The canvas and mask at the size this panel is drawn, for sd-cli's -i and --mask."""
+	image, mask = source
+	init = os.path.join(folder, f"init-{number}.png")
+	mask_path = os.path.join(folder, f"mask-{number}.png")
+	ImageOps.fit(image, size, Image.Resampling.LANCZOS).save(init, "PNG")
+	ImageOps.fit(mask, size, Image.Resampling.NEAREST).save(mask_path, "PNG")
+	return {"init": init, "mask": mask_path}
+
+
+KEEP_FEATHER = 2  # px of soft edge where kept and drawn pixels meet
+
+
+def _keep_masked(drawn, source):
+	"""Put the photo's own pixels back wherever the mask is black. The model works on a coarse
+	grid, so a few garment pixels near the edge could otherwise shift."""
+	image, mask = source
+	image = ImageOps.fit(image, drawn.size, Image.Resampling.LANCZOS)
+	keep = ImageOps.invert(ImageOps.fit(mask, drawn.size, Image.Resampling.NEAREST))
+	keep = keep.filter(ImageFilter.MinFilter(2 * KEEP_FEATHER + 1)).filter(ImageFilter.GaussianBlur(KEEP_FEATHER))
+	return Image.composite(image, drawn, keep)
 
 
 def _save_reference(photo, path, long_side):
