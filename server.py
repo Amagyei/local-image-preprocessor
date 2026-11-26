@@ -212,7 +212,7 @@ def parse_batch(body):
 		raise BadRequest("The batch_id must be 1 to 64 letters, digits, - or _.")
 	shared = data.get("init_images")
 
-	jobs, seen = [], set()
+	jobs = []
 	for number, item in enumerate(items, start=1):
 		if not isinstance(item, dict):
 			raise BadRequest(f"Job {number} wasn't a JSON object.")
@@ -221,9 +221,7 @@ def parse_batch(body):
 			job = job_from(merged)
 		except BadRequest as e:
 			raise BadRequest(f"Job {number}: {e}")
-		if job.key not in seen:  # the same drawing twice is one drawing
-			seen.add(job.key)
-			jobs.append(job)
+		jobs.append(job)
 	return batch_id, jobs
 
 
@@ -498,8 +496,9 @@ class Service:
 	# --- Batches: many jobs queued, watched and collected together ------------------------
 
 	def submit_batch(self, batch_id, jobs):
-		"""Queue every job as a draft and remember they belong together. Sending the same batch again
-		queues nothing twice; jobs that are new are added to it."""
+		"""Queue every job as a draft and remember they belong together. Returns the job ids in the
+		order the jobs were sent, so the caller can tell which is which. Sending the same batch again
+		queues nothing twice; jobs that are new are added to it. The same drawing twice is one job."""
 		for number, job in enumerate(jobs, start=1):
 			try:
 				panels_module.plan(job.prompt, job.width, job.height, self.config["max_long_side"])
@@ -508,11 +507,13 @@ class Service:
 		keys = [self.submit_durable(job).key for job in jobs]
 		with self.lock:
 			batch = self.batches.get(batch_id) or {"id": batch_id, "created": time.time(), "job_ids": []}
-			batch["job_ids"] += [key for key in keys if key not in batch["job_ids"]]
+			for key in dict.fromkeys(keys):  # each drawing once, in the order sent
+				if key not in batch["job_ids"]:
+					batch["job_ids"].append(key)
 			self.batches[batch_id] = batch
 			self._write_batch(batch)
-		self.observer.record("batch_queued", batch=batch_id, jobs=len(keys), waiting=self.queue.qsize())
-		return batch_id
+		self.observer.record("batch_queued", batch=batch_id, jobs=len(set(keys)), waiting=self.queue.qsize())
+		return keys
 
 	def batch_state(self, batch_id):
 		batch = self.batches.get(batch_id)
@@ -1019,12 +1020,13 @@ def make_handler(service):
 			if self.path == "/batches":
 				try:
 					batch_id, jobs = parse_batch(self.rfile.read(length))
-					service.submit_batch(batch_id, jobs)
+					job_ids = service.submit_batch(batch_id, jobs)
 				except (BadRequest, panels_module.PromptError) as e:
 					self._send(400, {"error": str(e)})
 					return
 				# Answer at once, like /jobs: the drawing goes on whether or not the laptop stays connected.
-				self._send(202, service.batch_state(batch_id))
+				# job_ids is one id per job sent, in the order sent (a repeated drawing repeats its id).
+				self._send(202, dict(service.batch_state(batch_id), job_ids=job_ids))
 				return
 
 			queued = self.path == "/jobs"
