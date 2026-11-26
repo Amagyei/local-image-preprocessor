@@ -493,6 +493,7 @@ class Service(unittest.TestCase):
 		status, data = self.request("POST", "/batches", body)
 		self.assertEqual(status, 202)
 		self.assertEqual(data["total"], 2)  # the same words on a different photo are another drawing
+		self.assertEqual(data["job_ids"], [j["job_id"] for j in data["jobs"]])
 		self.assertEqual(self.request("POST", "/batches", {"jobs": [{"prompt": "x", "width": 768, "height": 1024}]})[0], 400)
 
 	def test_one_bad_job_refuses_the_whole_batch(self):
@@ -526,6 +527,9 @@ class Service(unittest.TestCase):
 	def test_a_batch_sent_again_draws_nothing_twice(self):
 		_, first = self.submit_batch(("One.", "One.", "Two."), batch_id="b")
 		self.assertEqual(first["total"], 2)  # the same drawing twice is one drawing
+		self.assertEqual(len(first["job_ids"]), 3)  # but the answer has an id for every job sent, in order
+		self.assertEqual(first["job_ids"][0], first["job_ids"][1])
+		self.assertNotEqual(first["job_ids"][0], first["job_ids"][2])
 		self.assertTrue(self.wait_for_batch("b", "done"))
 		_, again = self.submit_batch(("One.", "Two."), batch_id="b")
 		self.assertEqual([j["job_id"] for j in again["jobs"]], [j["job_id"] for j in first["jobs"]])
@@ -592,7 +596,7 @@ class Service(unittest.TestCase):
 		batch_id, jobs = server.parse_batch(json.dumps({"batch_id": "b", "init_images": [garment_photo()], "jobs": [
 			{"prompt": "One.", "width": 768, "height": 1024}, {"prompt": "Two.", "width": 768, "height": 1024},
 		]}))
-		before.submit_batch(batch_id, jobs)
+		self.assertEqual(len(before.submit_batch(batch_id, jobs)), 2)
 		self.assertTrue(self.wait_until(lambda: before.batch_state("b")["status"] == "done"))
 
 		after = server.Service(config)

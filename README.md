@@ -62,6 +62,7 @@ A batch is a group of drafts the laptop can send in one call, watch as one thing
  "jobs": [{"prompt": "...", "width": 768, "height": 1024, "seed": 1}, {"prompt": "...", "width": 768, "height": 1024, "init_images": ["<this job's own photo>"]}]}
 ```
 
+- The `202` answer is the batch's state plus `job_ids`: one id per job you sent, in the order you sent them (a drawing sent twice repeats its id), so you can tell which is which.
 - Each job takes what `POST /jobs` takes. A shared `init_images` is sent once, and a job's own `init_images` replaces it.
 - Every job is checked before any is queued, so one bad job (the error says which, "Job 2: ...") refuses the whole batch and nothing is drawn.
 - A batch holds at most 50 jobs. `batch_id` is 1 to 64 letters, digits, `-` or `_`; leave it out and the Mac makes one.
